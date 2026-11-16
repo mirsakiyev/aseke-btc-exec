@@ -1,0 +1,18 @@
+{
+  "close_with_open_payload.json": "PAYLOAD_MISMATCH",
+  "credentials_in_signal.json": "UNKNOWN_FIELD",
+  "entry_relative_with_price.json": "INVALID_LEVEL_SPEC",
+  "float_price.json": "INVALID_NUMBER",
+  "holding_both_forms.json": "HOLDING_RULE_CONFLICT",
+  "inverse_product.json": "UNSUPPORTED_PRODUCT",
+  "leverage_101.json": "INVALID_LEVERAGE",
+  "long_stop_above_entry.json": "INVALID_GEOMETRY",
+  "naive_timestamp.json": "INVALID_TIMESTAMP",
+  "nan_price.json": "INVALID_NUMBER",
+  "non_utc_offset.json": "INVALID_TIMESTAMP",
+  "open_missing_expiry.json": "MISSING_FIELD",
+  "open_revision_2.json": "INVALID_REVISION",
+  "tp_fractions_not_one.json": "INVALID_TP_FRACTIONS",
+  "unknown_field.json": "UNKNOWN_FIELD",
+  "unknown_schema_version.json": "UNKNOWN_SCHEMA_VERSION"
+}

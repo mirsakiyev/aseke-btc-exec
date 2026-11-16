@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aseke-btc-exec"
+version = "0.1.0"
+description = "ASEKE BTC Exec - Phase 1 simulation-only execution worker (no live trading)"
+readme = "README.md"
+requires-python = ">=3.12"
+# Runtime uses only the Python standard library (sqlite3, decimal, tomllib, argparse).
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "jsonschema>=4"]
+
+[project.scripts]
+aseke-exec = "aseke_exec.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

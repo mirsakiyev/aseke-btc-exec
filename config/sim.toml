@@ -1,0 +1,118 @@
+# ASEKE BTC Exec - Phase 1 sample configuration (SIMULATION ONLY).
+# Every account, venue and balance below is synthetic. No credentials exist here
+# or anywhere in Phase 1. mode = "live" is refused before any adapter is built.
+# Money/price values are decimal STRINGS (floats are rejected).
+
+mode = "simulation"
+data_dir = "../var"            # relative to this file; keep on a LOCAL disk
+
+[worker]
+poll_interval_seconds = 2
+reconcile_every_cycles = 10    # periodic unowned-exposure scan
+
+[signals]
+# A producer name is NOT authentication. Future live entries require the trusted Lab producer
+# with a real authentication mechanism (see docs/lab-publisher-integration.md).
+trusted_producers = ["aseke-btc-lab", "aseke-dummy-publisher"]
+dummy_producers = ["aseke-dummy-publisher"]   # dummy signals: simulation only
+max_signal_age_seconds = 120
+max_clock_skew_seconds = 5
+max_source_data_age_seconds = 300
+missing_predecessor_hold_seconds = 300
+allowed_currency_mappings = []  # identity only; USD and USDT are NOT interchangeable
+
+[execution]
+max_quote_age_seconds = 5
+unknown_resolution_checks = 3
+time_exit_overdue_grace_seconds = 60
+
+# ---------------------------------------------------------------- accounts
+# One strategy owner per account. Margin is INITIAL MARGIN PER TRADE (budget, not a promise).
+[[accounts]]
+id = "sim_alpha_a1"
+venue = "sim_alpha"
+strategy_owner = "lab_btc_breakout"
+enabled_for_entries = true
+margin_currency = "USDT"
+initial_margin_per_trade = "100.00"
+adverse_entry_tolerance = "100.00"      # quote currency; adverse direction only
+allowed_level_policies = ["ABSOLUTE"]   # ENTRY_RELATIVE must be explicitly enabled
+max_spread_fraction = "0.002"
+collateral_buffer_fraction = "0.05"
+max_initial_margin_hard = "110.00"      # actual-fill breach => block + emergency close
+max_notional_hard = "600.00"
+# max_loss_at_stop = "10.00"            # optional: rejects entries; never moves the SL
+[accounts.instruments]
+"BTC/USDT:USDT" = "BTCUSDT-ALPHA"
+
+[[accounts]]
+id = "sim_beta_b1"
+venue = "sim_beta"
+strategy_owner = "lab_btc_breakout"
+enabled_for_entries = true
+margin_currency = "USDT"
+initial_margin_per_trade = "100.00"
+adverse_entry_tolerance = "100.00"
+allowed_level_policies = ["ABSOLUTE"]
+max_spread_fraction = "0.002"
+collateral_buffer_fraction = "0.05"
+max_initial_margin_hard = "110.00"
+max_notional_hard = "600.00"
+[accounts.instruments]
+"BTC/USDT:USDT" = "BTCUSDT-BETA"
+
+[[routes]]
+strategy_id = "lab_btc_breakout"
+accounts = ["sim_alpha_a1", "sim_beta_b1"]
+
+# ---------------------------------------------------------------- simulator
+# Synthetic venues with deliberately different contract multipliers and increments.
+# These are NOT models of MEXC, KuCoin, Kraken or any real exchange.
+[sim]
+db_file = "sim_exchange.db"
+initial_price = "64500.0"
+initial_depth_btc = "1"
+
+[sim.venues.sim_alpha]
+taker_fee_rate = "0.0006"
+supports_isolated = true
+supports_cross = true
+supports_amend = true
+trigger_references = ["LAST", "MARK", "INDEX"]
+[sim.venues.sim_alpha.instruments."BTCUSDT-ALPHA"]
+base = "BTC"
+quote = "USDT"
+settle = "USDT"
+product_type = "LINEAR_PERPETUAL"
+contract_multiplier = "0.001"   # BTC per contract
+tick_size = "0.1"
+qty_step = "1"
+min_qty = "1"
+max_leverage = 100
+
+[sim.venues.sim_beta]
+taker_fee_rate = "0.0005"
+supports_isolated = true
+supports_cross = true
+supports_amend = false          # exercises place-new-then-cancel-old stop resizing
+trigger_references = ["LAST", "MARK"]
+[sim.venues.sim_beta.instruments."BTCUSDT-BETA"]
+base = "BTC"
+quote = "USDT"
+settle = "USDT"
+product_type = "LINEAR_PERPETUAL"
+contract_multiplier = "0.0001"
+tick_size = "0.05"
+qty_step = "5"
+min_qty = "10"
+max_leverage = 50
+
+[sim.accounts.sim_alpha_a1]
+venue = "sim_alpha"
+currency = "USDT"
+starting_balance = "1000.00"
+
+[sim.accounts.sim_beta_b1]
+venue = "sim_beta"
+currency = "USDT"
+starting_balance = "1000.00"

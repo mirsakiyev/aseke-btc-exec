@@ -1,0 +1,39 @@
+{
+  "schema_version": "aseke.exec.signal/1",
+  "environment": "SIMULATION",
+  "producer": {
+    "name": "aseke-dummy-publisher",
+    "instance": "example"
+  },
+  "event_id": "fixture-long-1-r2-amend_exits",
+  "trade_id": "fixture-long-1",
+  "strategy_id": "lab_btc_breakout",
+  "strategy_version": "1.0.0",
+  "event_type": "AMEND_EXITS",
+  "revision": 2,
+  "created_at": "2026-01-05T12:05:00.000Z",
+  "instrument": {
+    "base": "BTC",
+    "quote": "USDT",
+    "settle": "USDT",
+    "product_type": "LINEAR_PERPETUAL"
+  },
+  "amend": {
+    "exits": {
+      "level_policy": "ABSOLUTE",
+      "trigger_reference": "LAST",
+      "stop": {
+        "price": "64600.10"
+      },
+      "take_profits": [
+        {
+          "price": "66500.10",
+          "quantity_fraction": "1"
+        }
+      ]
+    },
+    "holding": {
+      "max_holding_seconds": 7200
+    }
+  }
+}

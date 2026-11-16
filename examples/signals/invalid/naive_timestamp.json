@@ -1,0 +1,53 @@
+{
+  "schema_version": "aseke.exec.signal/1",
+  "environment": "SIMULATION",
+  "producer": {
+    "name": "aseke-dummy-publisher",
+    "instance": "example"
+  },
+  "event_id": "fixture-long-1-r1-open",
+  "trade_id": "fixture-long-1",
+  "strategy_id": "lab_btc_breakout",
+  "strategy_version": "1.0.0",
+  "event_type": "OPEN",
+  "revision": 1,
+  "created_at": "2026-01-05T12:00:00",
+  "instrument": {
+    "base": "BTC",
+    "quote": "USDT",
+    "settle": "USDT",
+    "product_type": "LINEAR_PERPETUAL"
+  },
+  "source": {
+    "venue": "lab_source_feed",
+    "instrument": "BTCUSDT",
+    "reference_price_type": "LAST",
+    "quote_currency": "USDT",
+    "data_time": "2026-01-05T12:00:00.000Z"
+  },
+  "open": {
+    "direction": "LONG",
+    "leverage": 5,
+    "entry_intent": "IMMEDIATE_IOC",
+    "reference_entry": "64500.10",
+    "expires_at": "2026-01-05T12:10:00.000Z",
+    "exits": {
+      "level_policy": "ABSOLUTE",
+      "trigger_reference": "LAST",
+      "stop": {
+        "price": "64000.10"
+      },
+      "take_profits": [
+        {
+          "price": "66000.10",
+          "quantity_fraction": "1"
+        }
+      ]
+    }
+  },
+  "source_risk": {
+    "risk_fraction": "0.002",
+    "basis": "SOURCE_PAPER_EQUITY",
+    "note": "informational only; not a stop or cap"
+  }
+}
