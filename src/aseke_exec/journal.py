@@ -19,7 +19,7 @@ from typing import Any, Iterator
 from .clock import iso, parse_utc
 from .num import D, s
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -113,12 +113,35 @@ CREATE TABLE IF NOT EXISTS balance_snapshots (
   currency TEXT, wallet TEXT, available TEXT);
 """
 
+_MIGRATION_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "executions": [
+        ("stop_coverage", "TEXT"),            # NONE | UNVERIFIED | VERIFIED
+        ("tp_coverage", "TEXT"),              # NONE | DEGRADED | COMPLETE
+        ("unprotected_since", "TEXT"),        # exposure observed without a verified stop
+        ("max_unprotected_seconds", "TEXT"),  # longest measured interval (decimal seconds)
+        ("tp_fail_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("tp_retry_at", "TEXT"),
+        ("stop_fix_retry_at", "TEXT"),
+    ],
+    "events": [
+        ("auth_mode", "TEXT"),                # HMAC | UNSIGNED_COMPAT
+        ("auth_key_id", "TEXT"),
+        ("envelope_issued_at", "TEXT"),
+        ("envelope_hash", "TEXT"),
+    ],
+}
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS operator_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE,
+  action TEXT NOT NULL, target TEXT, outcome TEXT NOT NULL, detail TEXT);
+"""
+
 DECIMAL_COLS = frozenset({
     "requested_margin", "target_notional", "sizing_price", "limit_price", "planned_qty",
     "planned_qty_btc", "planned_notional", "planned_margin", "fee_reservation", "reserved_amount",
     "filled_qty", "filled_qty_btc", "avg_fill", "filled_notional", "actual_margin",
     "unused_allocation", "entry_fees", "exit_fees", "realized_pnl", "net_pnl", "risk_at_stop",
-    "pnl_at_stop", "risk_pct_of_margin", "protected_qty", "qty", "trigger_price", "avg_price",
+    "pnl_at_stop", "risk_pct_of_margin", "protected_qty", "max_unprotected_seconds", "qty", "trigger_price", "avg_price",
     "price", "fee", "wallet", "available"})
 JSON_COLS = frozenset({"policy_snapshot", "instrument_snapshot", "plan", "exit_spec", "exit_plan",
                        "holding", "source_risk", "routing", "detail"})
@@ -153,26 +176,75 @@ def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 class Journal:
-    def __init__(self, path: str | Path):
+    """Single-writer journal.
+
+    Topology (see docs/runbook.md, SQLite WAL-reset-bug mitigation): exactly one read-write
+    connection exists at a time - the worker's (all mutating CLI commands either hold the worker
+    lock or queue a control request for the running worker). Status/health readers open
+    ``readonly=True`` connections (``mode=ro``) which cannot write or checkpoint.
+    """
+
+    def __init__(self, path: str | Path, *, readonly: bool = False, busy_timeout_ms: int = 15000):
         self.path = Path(path)
+        self.readonly = readonly
+        self._depth = 0
+        self._faults: dict[str, int] = {}
+        if readonly:
+            if not self.path.exists():
+                raise FileNotFoundError(f"journal not found: {self.path}")
+            self.conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True,
+                                        isolation_level=None, timeout=busy_timeout_ms / 1000)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=15)
+        self.conn = sqlite3.connect(str(self.path), isolation_level=None,
+                                    timeout=busy_timeout_ms / 1000)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=15000")
         self.conn.executescript(_SCHEMA)
-        self.conn.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)",
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Idempotent, additive migrations (existing data is preserved)."""
+        for table, cols in _MIGRATION_COLUMNS.items():
+            have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        self.conn.executescript(_SCHEMA_V2)
+        self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)",
                           (str(SCHEMA_VERSION),))
-        self._depth = 0
+
+    def schema_version(self) -> int:
+        r = self.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        return int(r[0]) if r else 0
 
     def close(self) -> None:
         self.conn.close()
 
+    # ---- test-storage fault injection (never armed in production code paths)
+    def inject_failure(self, where: str, count: int = 1) -> None:
+        """Arm ``count`` simulated failures at ``begin`` or ``commit`` of the next transactions."""
+        assert where in ("begin", "commit")
+        self._faults[where] = self._faults.get(where, 0) + count
+
+    def _take_fault(self, where: str) -> bool:
+        n = self._faults.get(where, 0)
+        if n > 0:
+            self._faults[where] = n - 1
+            return True
+        return False
+
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
-        """Re-entrant BEGIN IMMEDIATE transaction."""
+        """Re-entrant BEGIN IMMEDIATE transaction. A failed COMMIT is rolled back so the
+        connection never stays wedged inside a transaction."""
+        if self.readonly:
+            raise sqlite3.OperationalError("journal opened read-only")
         if self._depth:
             self._depth += 1
             try:
@@ -180,6 +252,8 @@ class Journal:
             finally:
                 self._depth -= 1
             return
+        if self._take_fault("begin"):
+            raise sqlite3.OperationalError("database is locked (injected test fault)")
         self.conn.execute("BEGIN IMMEDIATE")
         self._depth = 1
         try:
@@ -190,6 +264,8 @@ class Journal:
             raise
         self._depth = 0
         try:
+            if self._take_fault("commit"):
+                raise sqlite3.OperationalError("disk I/O error (injected test fault at COMMIT)")
             self.conn.execute("COMMIT")
         except BaseException:
             if self.conn.in_transaction:

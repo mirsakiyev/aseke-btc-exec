@@ -7,7 +7,9 @@ file to its reason code). Example timestamps are **scenario fixtures** (2026-01-
 use `aseke-exec publish-example` for signals stamped with the current clock.
 
 ## Rules
-- Strict: unknown fields are rejected (`UNKNOWN_FIELD`). Credentials, balances and account
+- Strict: unknown fields are rejected (`UNKNOWN_FIELD`); duplicate JSON object keys are
+  rejected (`DUPLICATE_JSON_KEY`, Phase 2A fix - previously the last value silently won).
+- Optional authentication wrapper: [signal-envelope.md](signal-envelope.md). Credentials, balances and account
   selection are **not** part of the contract — routing and risk limits belong to Exec config.
 - Prices, fractions and amounts are **decimal strings** (`"64500.10"`); JSON numbers,
   `NaN`/`Infinity` are rejected. `leverage`, `revision`, `max_holding_seconds` are integers.

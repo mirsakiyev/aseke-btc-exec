@@ -11,21 +11,25 @@ from pathlib import Path
 from typing import Any
 
 from . import PHASE, __version__
+from .auth import build_envelope, generate_key_hex, load_secret, strict_loads
 from .clock import SystemClock
 from .config import Config, ConfigError, load_config
 from .examples import EXAMPLE_KINDS, build_amend, build_cancel, build_close, build_open
-from .inbox import SignalExists, publish_event
+from .inbox import SignalExists, publish_event, signal_filename
 from .journal import Journal
 from .lock import LockHeld, ProcessLock
 from .num import show
-from .runtime import build_runtime, run_worker, status_report, write_status
+from .runtime import (
+    build_runtime, drain_controls, run_worker, status_report, submit_control, write_heartbeat,
+    write_status,
+)
 from .sim import FAULT_MODES, FAULT_OPS, SimExchange
 
 DEFAULT_CONFIG = "config/sim.toml"
 
 
 def _cfg(args: argparse.Namespace) -> Config:
-    return load_config(args.config)
+    return load_config(args.config, data_dir=args.data_dir)
 
 
 def _setup_logging(cfg: Config | None, verbose: bool) -> None:
@@ -44,7 +48,7 @@ def _print(obj: Any) -> None:
 # ------------------------------------------------------------------ commands
 def cmd_validate(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
-    print(f"OK: configuration valid (mode=simulation, phase {PHASE})")
+    print(f"OK: configuration valid (mode=simulation, phase {PHASE}, auth={cfg.auth.mode})")
     print(f"  data_dir: {cfg.data_dir}")
     for aid, a in cfg.accounts.items():
         print(f"  account {aid}: venue={a.venue} owner={a.strategy_owner} "
@@ -53,15 +57,39 @@ def cmd_validate(args: argparse.Namespace) -> int:
               f"entries={'on' if a.enabled_for_entries else 'off'}")
     for sid, accs in cfg.routes.items():
         print(f"  route {sid} -> {', '.join(accs)}")
+    for kid, k in cfg.auth.keys.items():
+        print(f"  auth key {kid}: producer={k.producer} status={k.status} strategies={sorted(k.strategies)} "
+              f"source={'env ' + k.secret_env if k.secret_env else 'file'}")
     for w in cfg.warnings:
         print(f"  WARNING: {w}")
+    return 0
+
+
+def cmd_runtime_info(args: argparse.Namespace) -> int:
+    from .ops import runtime_info
+    try:
+        cfg: Config | None = _cfg(args)
+    except ConfigError:
+        cfg = None
+    _print(runtime_info(cfg))
+    return 0
+
+
+def cmd_init_runtime(args: argparse.Namespace) -> int:
+    from .ops import init_runtime
+    cfg = _cfg(args)
+    try:
+        _print(init_runtime(cfg))
+    except FileExistsError as e:
+        print(f"refused: {e}")
+        return 2
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     _setup_logging(cfg, args.verbose)
-    n = run_worker(cfg, args.max_cycles, Path(args.config).resolve())
+    n = run_worker(cfg, args.max_cycles, Path(args.config).resolve(), poll_seconds=args.poll_seconds)
     print(f"worker exited after {n} cycle(s)")
     return 0
 
@@ -74,15 +102,19 @@ def _with_runtime(args: argparse.Namespace, fn: Any) -> int:
         try:
             return fn(rt)
         finally:
-            write_status(rt)
-            rt.close()
+            try:
+                write_heartbeat(rt, kind="one-shot")
+                write_status(rt)
+            finally:
+                rt.close()
 
 
 def cmd_cycle(args: argparse.Namespace) -> int:
     def go(rt: Any) -> int:
+        drain_controls(rt)
         rec = rt.engine.startup_reconcile()
         res = rt.engine.run_cycle()
-        _print({"reconcile": rec, "ingested": res["ingested"]})
+        _print({"reconcile": rec, "ingested": res["ingested"], "stage_errors": res["errors"]})
         return 0
     return _with_runtime(args, go)
 
@@ -94,12 +126,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return _with_runtime(args, go)
 
 
-def _journal(args: argparse.Namespace) -> Journal:
-    return Journal(_cfg(args).journal_path)
-
-
 def cmd_status(args: argparse.Namespace) -> int:
-    j = _journal(args)
+    cfg = _cfg(args)
+    if not cfg.journal_path.exists():
+        print(f"no journal at {cfg.journal_path} (run init-runtime or a cycle first)")
+        return 2
+    j = Journal(cfg.journal_path, readonly=True)  # reader: cannot write or checkpoint
     try:
         rep = status_report(j, args.limit)
     finally:
@@ -121,7 +153,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     for e in rep["recent_executions"]:
         print(f"  #{e['id']:<3} {e['trade_id']:<24} {e['account_id']:<13} {e['direction']:<5} "
               f"{e['state']:<16} fill={e.get('filled_qty')}@{e.get('avg_fill')} "
-              f"margin={e.get('actual_margin')} risk@SL={e.get('risk_at_stop')} "
+              f"margin={e.get('actual_margin')} stop={e.get('stop_coverage')} tp={e.get('tp_coverage')} "
               f"{e.get('reason_code') or e.get('close_reason') or ''}")
     if rep["open_incidents"]:
         print("OPEN INCIDENTS:")
@@ -133,80 +165,168 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pause(args: argparse.Namespace, value: str) -> int:
-    j = _journal(args)
-    try:
-        j.set_control("pause_new_entries", value, args.reason, SystemClock().now())
-    finally:
-        j.close()
-    print("new entries PAUSED (protection, exits and reconciliation continue)" if value == "1"
-          else "new entries RESUMED")
-    return 0
+def cmd_health(args: argparse.Namespace) -> int:
+    from .ops import health_report
+    rep = health_report(_cfg(args))
+    if args.json:
+        _print(rep)
+    else:
+        p, lc = rep["process"], rep["lifecycle"]
+        print(f"process running: {p['running']} (heartbeat age {p['heartbeat_age_seconds']}s, pid {p['pid']}, "
+              f"cycles {p['cycles']}, last cycle {p['last_cycle_ms']} ms)")
+        print(f"lifecycle healthy: {lc['healthy']}")
+        for r in lc["reasons"]:
+            print(f"  - {r}")
+    return 0 if rep["lifecycle"]["healthy"] else 1
+
+
+def _control(args: argparse.Namespace, action: str, target: str | None = None, **extra: Any) -> int:
+    outcome, msg = submit_control(_cfg(args), action, target, **extra)
+    print(f"{outcome}: {msg}")
+    return 0 if outcome in ("APPLIED", "QUEUED", "DUPLICATE") else 2
 
 
 def cmd_account(args: argparse.Namespace) -> int:
-    j = _journal(args)
-    now = SystemClock().now()
-    try:
-        if j.account(args.account_id) is None:
-            print(f"unknown account {args.account_id} (run a cycle first)")
-            return 2
-        if args.action == "disable":
-            j.update("accounts", "account_id", args.account_id, operator_disabled=1, updated_at=now)
-            print(f"{args.account_id}: disabled for NEW entries; existing exposure stays managed")
-        elif args.action == "enable":
-            j.update("accounts", "account_id", args.account_id, operator_disabled=0, updated_at=now)
-            print(f"{args.account_id}: enabled for new entries")
-        else:
-            inc = j.open_incidents(args.account_id)
-            if inc:
-                print(f"refused: {len(inc)} open incident(s) on {args.account_id}; resolve them first")
-                return 2
-            j.update("accounts", "account_id", args.account_id, entries_blocked=0, block_reason=None,
-                     updated_at=now)
-            print(f"{args.account_id}: entry block cleared by operator")
-    finally:
-        j.close()
-    return 0
+    return _control(args, f"account-{args.action}", args.account_id)
 
 
 def cmd_incident_resolve(args: argparse.Namespace) -> int:
-    j = _journal(args)
-    try:
-        j.update("incidents", "id", args.incident_id, status="RESOLVED",
-                 resolved_at=SystemClock().now(), resolution=f"operator: {args.note}")
-    finally:
-        j.close()
-    print(f"incident {args.incident_id} resolved")
-    return 0
+    return _control(args, "incident-resolve", str(args.incident_id), note=args.note)
+
+
+def _signer(cfg: Config) -> tuple[str, bytes]:
+    kid = cfg.auth.signer_key_id
+    if not kid:
+        raise ConfigError(["auth.signer.key_id is not configured (needed for local signing)"])
+    secret = load_secret(cfg.auth.keys[kid])
+    if secret is None:
+        spec = cfg.auth.keys[kid]
+        raise ConfigError([f"signing key {kid!r} unavailable: set env {spec.secret_env}" if spec.secret_env
+                           else f"signing key {kid!r} unavailable: secret file missing/invalid"])
+    return kid, secret
+
+
+def _publish(cfg: Config, ev: dict[str, Any], signed: bool) -> Path:
+    if signed:
+        kid, secret = _signer(cfg)
+        env = build_envelope(ev, key=secret, key_id=kid, audience=cfg.auth.audience,
+                             issued_at=SystemClock().now())
+        return publish_event(cfg.inbox_dir, env, filename=signal_filename(ev))
+    return publish_event(cfg.inbox_dir, ev)
 
 
 def cmd_publish_example(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     now = SystemClock().now()
     trade_id = args.trade_id or f"demo-{args.kind}-{now.strftime('%Y%m%d%H%M%S')}"
+    producer = cfg.auth.keys[cfg.auth.signer_key_id].producer if args.signed and cfg.auth.signer_key_id else None
+    kw = {"producer": producer} if producer else {}
     if args.kind in EXAMPLE_KINDS:
-        ev = build_open(now, trade_id, **EXAMPLE_KINDS[args.kind])  # type: ignore[arg-type]
-    elif args.kind == "close":
-        ev = build_close(now, trade_id, args.revision)
-    elif args.kind == "cancel":
-        ev = build_cancel(now, trade_id, args.revision)
-    elif args.kind == "amend":
-        ev = build_amend(now, trade_id, args.revision, stop=args.stop or "64100.10",
-                         take_profits=[(args.tp or "66000.10", "1")])
-    else:
-        print(f"unknown kind {args.kind}")
-        return 2
-    if args.kind in ("close", "cancel", "amend") and not args.trade_id:
+        ev = build_open(now, trade_id, **EXAMPLE_KINDS[args.kind], **kw)  # type: ignore[arg-type]
+    elif args.kind in ("close", "cancel", "amend") and not args.trade_id:
         print("--trade-id is required for close/cancel/amend")
         return 2
+    elif args.kind == "close":
+        ev = build_close(now, trade_id, args.revision, **kw)
+    elif args.kind == "cancel":
+        ev = build_cancel(now, trade_id, args.revision, **kw)
+    else:
+        ev = build_amend(now, trade_id, args.revision, stop=args.stop or "64100.10",
+                         take_profits=[(args.tp or "66000.10", "1")], **kw)
     try:
-        p = publish_event(cfg.inbox_dir, ev)
+        p = _publish(cfg, ev, args.signed)
     except SignalExists as e:
         print(str(e))
         return 2
-    print(f"published {ev['event_type']} {ev['event_id']} (trade {trade_id}) -> {p}")
+    print(f"published {'SIGNED ' if args.signed else ''}{ev['event_type']} {ev['event_id']} "
+          f"(trade {trade_id}) -> {p}")
     return 0
+
+
+def cmd_auth(args: argparse.Namespace) -> int:
+    if args.action == "gen-key":
+        if not args.out:
+            print("--out PATH is required (store it in an excluded location such as secrets\\)")
+            return 2
+        out = Path(args.out)
+        if out.exists():
+            print(f"refused: {out} exists (never overwrite key material)")
+            return 2
+        out.parent.mkdir(parents=True, exist_ok=True)
+        repo = Path(__file__).resolve().parents[2]
+        resolved = out.resolve()
+        if repo in resolved.parents and (repo / "secrets") not in resolved.parents:
+            print(f"WARNING: {resolved} is inside the repository but not under the git-ignored "
+                  "secrets/ directory - make sure it can never be committed")
+        fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # owner-only on POSIX
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(generate_key_hex() + "\n")
+        print(f"wrote a new random 256-bit HMAC key to {out} (contents not printed). "
+              "Load it into the configured env var without echoing it, e.g. PowerShell: "
+              f"$env:<SECRET_ENV> = (Get-Content -Raw '{out}').Trim()")
+        return 0
+    cfg = _cfg(args)
+    if args.action == "check":
+        _print({"mode": cfg.auth.mode, "audience": cfg.auth.audience,
+                "keys": {k: {"status": v.status, "producer": v.producer,
+                             "secret_available": load_secret(v) is not None,
+                             "secret_source": f"env {v.secret_env}" if v.secret_env else "file"}
+                         for k, v in cfg.auth.keys.items()}})
+        return 0
+    # sign
+    if not args.infile:
+        print("--in FILE (unsigned v1 event JSON) is required")
+        return 2
+    ev = strict_loads(Path(args.infile).read_text(encoding="utf-8"))
+    try:
+        p = _publish(cfg, ev, signed=True)
+    except SignalExists as e:
+        print(str(e))
+        return 2
+    print(f"published SIGNED {ev.get('event_type')} {ev.get('event_id')} -> {p}")
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    from .ops import backup_runtime
+    try:
+        _print(backup_runtime(_cfg(args), Path(args.dest)))
+    except (FileExistsError, FileNotFoundError, ValueError) as e:
+        print(f"refused: {e}")
+        return 2
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    from .ops import restore_runtime
+    if not args.data_dir:
+        print("refused: --data-dir NEW_ROOT is required (restore never targets the default runtime)")
+        return 2
+    try:
+        _print(restore_runtime(Path(args.backup), _cfg(args)))
+    except (FileExistsError, FileNotFoundError, ValueError) as e:
+        print(f"refused: {e}")
+        return 2
+    print("next: run `cycle` (or `run`) with the same --data-dir; startup reconciliation runs "
+          "before any new entry")
+    return 0
+
+
+def cmd_soak(args: argparse.Namespace) -> int:
+    from .soak import run_soak
+    if not args.data_dir:
+        print("refused: --data-dir NEW_ROOT is required (soaks never use an existing runtime)")
+        return 2
+    logging.disable(logging.WARNING)
+    try:
+        rep = run_soak(args.config, args.data_dir, duration_seconds=args.duration_seconds,
+                       cycles=args.cycles, accelerated=args.accelerated, poll_seconds=args.poll_seconds,
+                       seed=args.seed)
+    except (FileExistsError, ValueError) as e:
+        print(f"refused: {e}")
+        return 2
+    _print(rep)
+    return 1 if rep["invariant_violations"] else 0
 
 
 def cmd_scenario(args: argparse.Namespace) -> int:
@@ -233,26 +353,33 @@ def cmd_scenario(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def _sim(args: argparse.Namespace) -> tuple[Config, SimExchange]:
-    cfg = _cfg(args)
-    sim = SimExchange(cfg.sim.db_path, SystemClock())
-    return cfg, sim
-
-
 def cmd_sim(args: argparse.Namespace) -> int:
-    cfg, sim = _sim(args)
-    try:
-        if args.action == "init":
-            if args.reset:
-                try:
-                    lock = ProcessLock(cfg.lock_path).acquire()
-                except LockHeld as e:
-                    print(f"refused: {e}")
-                    return 2
-                lock.release()
-            sim.install(cfg.sim, reset=args.reset)
-            print(f"simulator {'reset and ' if args.reset else ''}initialised at {cfg.sim.db_path}")
-        elif args.action == "show":
+    cfg = _cfg(args)
+    if args.action == "init" and args.reset:
+        from .ops import journal_has_history
+        try:
+            lock = ProcessLock(cfg.lock_path).acquire()
+        except LockHeld as e:
+            print(f"refused: {e} (never reset an active runtime)")
+            return 2
+        try:
+            if journal_has_history(cfg):
+                print(f"refused: the execution journal in {cfg.data_dir} references simulated orders/"
+                      "positions; a simulator-only reset would leave it inconsistent. Initialise a fresh "
+                      "runtime instead: init-runtime --data-dir <NEW_ROOT>")
+                return 2
+            sim = SimExchange(cfg.sim.db_path, SystemClock())
+            try:
+                sim.install(cfg.sim, reset=True)
+            finally:
+                sim.close()
+        finally:
+            lock.release()
+        print(f"simulator reset and initialised at {cfg.sim.db_path} (journal had no history)")
+        return 0
+    if args.action == "show":
+        sim = SimExchange(cfg.sim.db_path, SystemClock())
+        try:
             out: dict[str, Any] = {}
             for v in cfg.sim.venues:
                 for sym in sim.symbols(v):
@@ -271,6 +398,20 @@ def cmd_sim(args: argparse.Namespace) -> int:
                                                     trigger=o["trigger_price"], cid=o["client_order_id"])
                                                for o in sim.all_orders(a.venue, aid) if o["status"] == "OPEN"]}
             _print(out)
+        finally:
+            sim.close()
+        return 0
+    # mutating harness commands: take the simulator-harness lock (backup quiesces it)
+    try:
+        hl = ProcessLock(cfg.sim_lock_path).acquire()
+    except LockHeld as e:
+        print(f"refused: {e} (a backup/maintenance holds the simulator)")
+        return 3
+    sim = SimExchange(cfg.sim.db_path, SystemClock())
+    try:
+        if args.action == "init":
+            sim.install(cfg.sim)
+            print(f"simulator initialised at {cfg.sim.db_path}")
         elif args.action == "set-market":
             venues = list(cfg.sim.venues) if args.venue == "all" else [args.venue]
             for v in venues:
@@ -283,30 +424,41 @@ def cmd_sim(args: argparse.Namespace) -> int:
             print(f"fault armed: {args.venue} {args.op} {args.mode} x{args.count}")
     finally:
         sim.close()
+        hl.release()
     return 0
 
 
 # ------------------------------------------------------------------ parser
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aseke-exec",
-                                description="ASEKE BTC Exec - Phase 1 SIMULATION ONLY execution worker")
+                                description="ASEKE BTC Exec - SIMULATION ONLY execution worker")
     p.add_argument("--config", default=os.environ.get("ASEKE_EXEC_CONFIG", DEFAULT_CONFIG))
+    p.add_argument("--data-dir", default=os.environ.get("ASEKE_EXEC_DATA_DIR"),
+                   help="isolated runtime root (overrides the config's data_dir)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("validate-config", help="validate configuration").set_defaults(fn=cmd_validate)
+    sub.add_parser("runtime-info", help="Python/SQLite/dependency/source/config fingerprint (no secrets)"
+                   ).set_defaults(fn=cmd_runtime_info)
+    sub.add_parser("init-runtime", help="create a FRESH isolated runtime root (refuses non-empty)"
+                   ).set_defaults(fn=cmd_init_runtime)
     r = sub.add_parser("run", help="run the worker in the foreground (Ctrl+C to stop)")
     r.add_argument("--max-cycles", type=int, default=None)
+    r.add_argument("--poll-seconds", type=float, default=None)
     r.set_defaults(fn=cmd_run)
     sub.add_parser("cycle", help="startup reconcile + one ingestion/maintenance cycle").set_defaults(fn=cmd_cycle)
     sub.add_parser("reconcile", help="reconcile accounts against the simulated venues").set_defaults(fn=cmd_reconcile)
-    st = sub.add_parser("status", help="show controls, accounts, executions, incidents, alerts")
+    st = sub.add_parser("status", help="controls, accounts, executions, incidents, alerts (read-only)")
     st.add_argument("--json", action="store_true")
     st.add_argument("--limit", type=int, default=20)
     st.set_defaults(fn=cmd_status)
-    for name, val in (("pause", "1"), ("resume", "0")):
+    he = sub.add_parser("health", help="process heartbeat vs lifecycle health (exit 0 healthy, 1 not)")
+    he.add_argument("--json", action="store_true")
+    he.set_defaults(fn=cmd_health)
+    for name in ("pause", "resume"):
         pp = sub.add_parser(name, help=f"{name} NEW entries (exits/protection continue)")
         pp.add_argument("--reason", default="operator")
-        pp.set_defaults(fn=lambda a, v=val: cmd_pause(a, v))
+        pp.set_defaults(fn=lambda a, n=name: _control(a, n, reason=a.reason))
     ac = sub.add_parser("account", help="disable/enable new entries or clear an entry block")
     ac.add_argument("action", choices=["disable", "enable", "unblock"])
     ac.add_argument("account_id")
@@ -322,7 +474,27 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--revision", type=int, default=2)
     pe.add_argument("--stop")
     pe.add_argument("--tp")
+    pe.add_argument("--signed", action="store_true", help="wrap in an HMAC envelope (auth.signer key)")
     pe.set_defaults(fn=cmd_publish_example)
+    au = sub.add_parser("auth", help="local simulation key management and signing (keys never printed)")
+    au.add_argument("action", choices=["gen-key", "check", "sign"])
+    au.add_argument("--out")
+    au.add_argument("--in", dest="infile")
+    au.set_defaults(fn=cmd_auth)
+    bk = sub.add_parser("backup", help="quiesced SQLite-API backup of journal+simulator to a NEW directory")
+    bk.add_argument("--dest", required=True)
+    bk.set_defaults(fn=cmd_backup)
+    rs = sub.add_parser("restore", help="restore a backup into a NEW --data-dir (never over a live runtime)")
+    rs.add_argument("--backup", required=True)
+    rs.set_defaults(fn=cmd_restore)
+    so = sub.add_parser("soak", help="bounded soak in a NEW --data-dir (real-time or --accelerated)")
+    g = so.add_mutually_exclusive_group(required=True)
+    g.add_argument("--duration-seconds", type=float)
+    g.add_argument("--cycles", type=int)
+    so.add_argument("--accelerated", action="store_true", help="injected clock (NOT a real-time soak)")
+    so.add_argument("--poll-seconds", type=float, default=0.5)
+    so.add_argument("--seed", type=int, default=7)
+    so.set_defaults(fn=cmd_soak)
     sc = sub.add_parser("scenario", help="run deterministic acceptance scenarios (temp dirs)")
     sc.add_argument("action", choices=["list", "run"])
     sc.add_argument("names", nargs="*")

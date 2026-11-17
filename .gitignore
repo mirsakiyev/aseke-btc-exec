@@ -10,3 +10,8 @@ var/
 *.db
 *.db-wal
 *.db-shm
+# Local key material (HMAC secrets) - never commit.
+secrets/
+*.key
+# Isolated runtime roots for demos, soaks, restores.
+runtime/

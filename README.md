@@ -1,110 +1,107 @@
-# ASEKE BTC Exec — Phase 1 (simulation only)
+# ASEKE BTC Exec — Phase 2A (simulation only)
 
 ASEKE BTC **Lab** decides which trading opportunities to authorize. ASEKE BTC **Exec**
 (this repository) receives those authorizations, validates them, sizes positions from its
 own per-account configuration, executes through adapters, manages protection and exits,
 and reconciles state.
 
-> **Phase 1 is simulation-only.** No real exchange orders, no API credentials, no
-> authenticated accounts, no fund transfers. `mode = "live"` and `LIVE` events are refused
-> before any order-capable activity. The synthetic venues `sim_alpha` / `sim_beta` are not
-> models of any real exchange. Nothing here validates real-exchange behaviour or implies
-> profitability.
+> **Simulation only.** No real exchange orders, no API credentials, no authenticated
+> exchange accounts, no fund transfers. `mode = "live"` and `LIVE` events are refused before
+> any order-capable activity. The synthetic venues `sim_alpha` / `sim_beta` are not models of
+> any real exchange. Nothing here validates real-exchange behaviour or implies profitability.
+> This is **not** live-trading approval.
 
 ## What it does
-- Strict versioned JSON signal contract (`aseke.exec.signal/1`) — see
+- Strict versioned JSON signal contract (`aseke.exec.signal/1`):
   [docs/signal-contract.md](docs/signal-contract.md), [schema](schemas/signal.v1.schema.json),
   [examples](examples/signals/).
-- Atomic file inbox → durable SQLite journal → per-account execution lifecycle:
-  validation → sizing/reservation → IOC entry → verified exchange-held protection →
-  TP/SL/time/Lab exits → reconciliation, incidents and alerts.
-- A deterministic, **persistent** simulated exchange (its own SQLite file) with order-book
-  IOC matching, partial fills, fees, isolated margin, LAST/MARK/INDEX triggers, reduce-only
-  closes and fault injection (rejects, timeouts before/after acceptance, stale/duplicate
-  observations, book shifts).
-- Standalone worker; no Claude/LLM session, dashboard, broker or service required.
+- Optional **authenticated envelope** (`aseke.exec.envelope/1`, HMAC-SHA-256, key scopes,
+  revocation, fail-closed): [docs/signal-envelope.md](docs/signal-envelope.md).
+- Atomic file inbox → durable SQLite journal (single writer) → per-account lifecycle:
+  validation → sizing/reservation → IOC entry → verified exchange-held protection
+  (stop coverage and TP coverage tracked separately) → TP/SL/time/Lab exits → reconciliation,
+  incidents, alerts.
+- Persistent deterministic simulator (own SQLite file) with fault injection.
+- Operator tooling: `health`, `runtime-info`, isolated `init-runtime`, quiesced
+  `backup`/`restore` into new roots, bounded `soak`. See [docs/runbook.md](docs/runbook.md).
 
-Architecture and lifecycle: [docs/architecture.md](docs/architecture.md).
-Acceptance evidence: [docs/acceptance-report.md](docs/acceptance-report.md).
+Architecture: [docs/architecture.md](docs/architecture.md). Acceptance evidence:
+[Phase 1](docs/acceptance-report.md), [Phase 2A](docs/phase2a-acceptance-report.md).
 Future real adapters: [docs/future-adapter-checklist.md](docs/future-adapter-checklist.md).
-Project rules for contributors/agents: [AGENTS.md](AGENTS.md).
+Rules for contributors/agents: [AGENTS.md](AGENTS.md).
 
-## Windows setup (PowerShell, from the repository root)
+> **Runtime note:** the embedded SQLite here (3.49.1) is affected by the upstream
+> WAL-reset bug. A single-writer topology mitigates it, but unattended operation is not
+> certified until a project-isolated runtime with SQLite ≥ 3.51.3 (or 3.50.7 / 3.44.6) is used.
+> Check with `.\scripts\aseke-exec.ps1 runtime-info`. Details: [runbook](docs/runbook.md).
 
+## Windows setup (PowerShell, repository root)
 ```powershell
-# one-time: create .venv with Python 3.12 and install (runtime is stdlib-only; dev: pytest, jsonschema)
 powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
-
-# equivalent manual steps
+# or manually:
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
+Every command goes through `.\scripts\aseke-exec.ps1` (= `.\.venv\Scripts\python.exe -m
+aseke_exec`). Use `--data-dir runtime\<name>` to give every demo/test/soak its **own runtime
+root** (git-ignored). Without `--data-dir` the config's `data_dir` (`var\`) is used.
 
-All commands below use the thin wrapper `.\scripts\aseke-exec.ps1`, which runs
-`.\.venv\Scripts\python.exe -m aseke_exec` with `config\sim.toml`. If script execution is
-restricted, prefix with `powershell -ExecutionPolicy Bypass -File`, or call
-`.\.venv\Scripts\python.exe -m aseke_exec <command>` directly. Runtime state (journal,
-simulator, inbox/archive/quarantine, logs, `status.json`, `alerts.jsonl`) lives in `var\`
-(git-ignored). Keep it on a local disk.
-
-## Reproducible demonstration (no network, no keys)
-
+## Demonstration (unsigned compatibility profile, isolated root)
 ```powershell
-.\scripts\aseke-exec.ps1 validate-config
-.\scripts\aseke-exec.ps1 sim init --reset                       # fresh synthetic venues @ 64500
-.\scripts\aseke-exec.ps1 publish-example long --trade-id demo-long-1
-.\scripts\aseke-exec.ps1 cycle                                  # reconcile + ingest + execute + protect
-.\scripts\aseke-exec.ps1 status                                 # both accounts OPEN_PROTECTED
-.\scripts\aseke-exec.ps1 sim show                               # venue positions + working SL/TP
-.\scripts\aseke-exec.ps1 sim set-market --price 66100           # TP triggers on the venues
-.\scripts\aseke-exec.ps1 cycle
-.\scripts\aseke-exec.ps1 status                                 # CLOSED (TAKE_PROFIT)
-.\scripts\aseke-exec.ps1 scenario run all                       # 27 deterministic acceptance scenarios
+$rt = "runtime\demo-" + (Get-Date -Format yyyyMMddHHmmss)
+.\scripts\aseke-exec.ps1 --data-dir $rt init-runtime
+.\scripts\aseke-exec.ps1 --data-dir $rt publish-example long --trade-id demo-long-1
+.\scripts\aseke-exec.ps1 --data-dir $rt cycle
+.\scripts\aseke-exec.ps1 --data-dir $rt status          # both accounts OPEN_PROTECTED, stop/tp coverage
+.\scripts\aseke-exec.ps1 --data-dir $rt sim set-market --price 66100
+.\scripts\aseke-exec.ps1 --data-dir $rt cycle
+.\scripts\aseke-exec.ps1 --data-dir $rt status          # CLOSED (TAKE_PROFIT)
+.\scripts\aseke-exec.ps1 scenario run all                # deterministic scenarios (own temp dirs)
+```
+Reference setup: LONG, leverage 5, entry 64500.10, SL 64000.10, TP 66000.10, margin 100.00
+USDT, tolerance 100.00 → ceiling 64600.10. `sim_alpha` buys 7 contracts (0.007 BTC),
+`sim_beta` 75 (0.0075 BTC). `publish-example` timestamps come from the current clock (expiry
+10 min, max signal age 120 s).
+
+## Strict signed-signal demonstration
+```powershell
+$rt = "runtime\strict-" + (Get-Date -Format yyyyMMddHHmmss)
+$cfg = "config\sim-strict.toml"
+.\scripts\aseke-exec.ps1 auth gen-key --out secrets\sim-demo-k1.key      # once; never printed
+$env:ASEKE_EXEC_HMAC_SIM_DEMO_K1 = (Get-Content -Raw secrets\sim-demo-k1.key).Trim()
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt init-runtime
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt auth check          # secret_available: true
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt publish-example long --signed --trade-id strict-1
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt publish-example long --trade-id unsigned-1   # refused
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt cycle
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt status   # strict-1 protected; unsigned-1 quarantined
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt health --json
 ```
 
-`publish-example` stamps `created_at`/`expires_at` from the current clock, so it never
-publishes an already-expired signal (expiry 10 minutes; max signal age 120 s — run `cycle`
-within two minutes, or keep the worker running with `run`). Reusing a `--trade-id` is
-correctly rejected (`DUPLICATE_OPEN_CONFLICT`); pick a new id. `sim init --reset` resets
-only the simulated exchange — if you reset it while the journal still holds open trades,
-the next cycle will (correctly) report the venue/journal mismatch; delete `var\` for a fully
-fresh start. `.\scripts\demo.ps1` runs the sequence above with a timestamped trade id.
-
-The example is the supplied reference setup: LONG, leverage 5, reference entry 64500.10,
-SL 64000.10, TP 66000.10, margin 100.00 USDT per account, adverse tolerance 100.00 →
-buy ceiling 64600.10 (SHORT floor would be 64400.10). `sim_alpha` (0.001 BTC/contract)
-gets 7 contracts = 0.007 BTC; `sim_beta` (0.0001 BTC/contract, step 5) gets 75 contracts =
-0.0075 BTC — comparable exposure from different native quantities.
-
-Other examples: `publish-example short|multi-tp|timed`, and
-`publish-example close|cancel|amend --trade-id <id> --revision <n>`.
-Partial-fill and failure behaviour is demonstrated by `scenario run ioc_outcomes
-protection_failure close_paths …` (see `scenario list`).
-
 ## Operating commands
-
 | Purpose | Command |
 |---|---|
-| Validate configuration | `.\scripts\aseke-exec.ps1 validate-config` |
-| Run worker (foreground, Ctrl+C) | `.\scripts\aseke-exec.ps1 run` |
-| One maintenance/ingestion cycle | `.\scripts\aseke-exec.ps1 cycle` |
-| Status / JSON status | `.\scripts\aseke-exec.ps1 status` / `status --json` |
-| Pause / resume NEW entries | `.\scripts\aseke-exec.ps1 pause` / `resume` |
-| Disable / enable an account for entries | `.\scripts\aseke-exec.ps1 account disable sim_beta_b1` |
-| Clear an entry block (after incidents resolved) | `.\scripts\aseke-exec.ps1 account unblock sim_beta_b1` |
-| Resolve an incident after review | `.\scripts\aseke-exec.ps1 incident resolve 3 --note "checked"` |
-| Reconcile against venues | `.\scripts\aseke-exec.ps1 reconcile` |
-| Publish example signals | `.\scripts\aseke-exec.ps1 publish-example long` |
-| Deterministic scenarios | `.\scripts\aseke-exec.ps1 scenario list` / `scenario run all` |
-| Simulator harness (works while worker is down) | `sim init / show / set-market / fault` |
+| Validate config / runtime fingerprint | `validate-config` · `runtime-info` |
+| Fresh isolated runtime | `--data-dir runtime\X init-runtime` |
+| Worker (foreground, Ctrl+C) | `run [--poll-seconds 2]` |
+| One cycle / reconcile | `cycle` · `reconcile` |
+| Status / health | `status [--json]` · `health [--json]` (exit 0 healthy) |
+| Pause / resume NEW entries | `pause` · `resume` (queued to a running worker) |
+| Account entries / unblock | `account disable|enable|unblock <id>` |
+| Resolve incident | `incident resolve <id> --note "..."` |
+| Publish signals | `publish-example long|short|multi-tp|timed [--signed]`, `close|cancel|amend --trade-id X` |
+| Keys (strict mode) | `auth gen-key --out <file>` · `auth check` · `auth sign --in <event.json>` |
+| Backup / restore | `backup --dest <new dir>` · `--data-dir <new root> restore --backup <dir>` |
+| Soak | `--data-dir <new root> soak --duration-seconds N` or `--cycles N --accelerated` |
+| Scenarios / simulator harness | `scenario list|run all` · `sim init|show|set-market|fault` |
 | Tests | `.\.venv\Scripts\python.exe -m pytest` |
 
-Pause and account-disable stop **new entries only**; protection, exits, time exits and
-reconciliation continue. Only one worker can run (`var\worker.lock`); a second instance is
-refused. Nothing installs a Windows service or scheduled task.
+Pause and account-disable stop **new entries only**. Only one worker can run per runtime root
+(OS lock). Nothing installs a Windows service or scheduled task. Never delete a runtime root
+or SQLite sidecar files as routine recovery; initialise a new root instead.
 
-## Phase 1 limitations (summary)
-Synthetic venues only; no liquidation or funding model; native attached brackets are not
-used (separate verified protective orders always); source-risk enforcement is not
-implemented (metadata is informational); amendments must be ABSOLUTE; single worker process.
-Full list: [docs/acceptance-report.md](docs/acceptance-report.md#limitations).
+## Limitations (summary)
+Synthetic venues only; no liquidation/funding model; separate (non-bracket) protective orders;
+source-risk metadata informational only; amendments ABSOLUTE only; HMAC is shared-key
+authentication only; affected embedded SQLite (see above). Full list:
+[docs/phase2a-acceptance-report.md](docs/phase2a-acceptance-report.md#limitations).

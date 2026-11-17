@@ -39,9 +39,21 @@ def _reject_constant(name: str) -> Any:
     raise Rejection(R.INVALID_NUMBER, f"non-finite JSON constant {name} is not allowed")
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise Rejection(R.DUPLICATE_JSON_KEY, f"duplicate JSON key {k!r} (ambiguous input)")
+        out[k] = v
+    return out
+
+
 def load_event_json(text: str) -> dict[str, Any]:
+    """Strict JSON decode: duplicate keys and NaN/Infinity are rejected; JSON numbers with a
+    fraction/exponent decode to Decimal (never float) and are then refused by the contract."""
     try:
-        obj = json.loads(text, parse_float=Decimal, parse_constant=_reject_constant)
+        obj = json.loads(text, parse_float=Decimal, parse_constant=_reject_constant,
+                         object_pairs_hook=_no_duplicate_keys)
     except Rejection:
         raise
     except (json.JSONDecodeError, ValueError) as e:

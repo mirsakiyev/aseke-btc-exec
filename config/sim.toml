@@ -25,6 +25,16 @@ allowed_currency_mappings = []  # identity only; USD and USDT are NOT interchang
 max_quote_age_seconds = 5
 unknown_resolution_checks = 3
 time_exit_overdue_grace_seconds = 60
+tp_retry_base_seconds = 5          # degraded TP retry backoff (doubles per failure)
+tp_retry_max_seconds = 300
+tp_escalate_after_failures = 5     # then a durable TP_PLACEMENT_PERSISTENT incident
+alert_dedup_seconds = 300          # identical alerts inside this window are counted, not repeated
+
+[auth]
+# Explicitly named compatibility profile: UNSIGNED simulation fixtures are accepted.
+# For authenticated ingestion use config/sim-strict.toml (mode = "strict"); strict mode never
+# falls back to unsigned acceptance. See docs/signal-envelope.md.
+mode = "simulation-compat-unsigned"
 
 # ---------------------------------------------------------------- accounts
 # One strategy owner per account. Margin is INITIAL MARGIN PER TRADE (budget, not a promise).

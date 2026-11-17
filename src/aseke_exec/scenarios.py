@@ -44,7 +44,10 @@ def default_config_dict() -> dict[str, Any]:
                     "max_source_data_age_seconds": 300, "missing_predecessor_hold_seconds": 300,
                     "allowed_currency_mappings": []},
         "execution": {"max_quote_age_seconds": 5, "unknown_resolution_checks": 3,
-                      "time_exit_overdue_grace_seconds": 60},
+                      "time_exit_overdue_grace_seconds": 60, "tp_retry_base_seconds": 5,
+                      "tp_retry_max_seconds": 300, "tp_escalate_after_failures": 5,
+                      "alert_dedup_seconds": 300},
+        "auth": {"mode": "simulation-compat-unsigned"},
         "accounts": [
             {"id": A, "venue": "sim_alpha", "strategy_owner": STRATEGY, "enabled_for_entries": True,
              "margin_currency": "USDT", "initial_margin_per_trade": "100.00",
@@ -112,8 +115,8 @@ class Harness:
         self._n = 0
 
     # ---- worker lifecycle
-    def start(self) -> Engine:
-        self.journal = Journal(self.cfg.journal_path)
+    def start(self, busy_timeout_ms: int = 15000) -> Engine:
+        self.journal = Journal(self.cfg.journal_path, busy_timeout_ms=busy_timeout_ms)
         adapters = {aid: SimAdapter(self.sim, a.venue, aid) for aid, a in self.cfg.accounts.items()}
         self.engine = Engine(self.cfg, self.journal, adapters, self.clock, Inbox(self.cfg.inbox_dir),
                              alert_sink=self.alerts.append)
@@ -778,8 +781,16 @@ def sc_tp_failure_degraded(h: Harness) -> dict[str, Any]:
     check(h.pos(B)["qty"] == 75, "position kept")
     check(any(a["code"] == "TP_PLACEMENT_FAILED" for a in h.alerts), "alerted")
     check(not h.j.account(B)["entries_blocked"], "no block for a TP-only failure")  # type: ignore[index]
+    check(h.ex("t-tpf", B)["tp_coverage"] == "DEGRADED" and h.ex("t-tpf", B)["stop_coverage"] == "VERIFIED",
+          "risk-protected but exit-plan degraded")
+    tp_attempts = len(h.j.q("SELECT id FROM orders WHERE leg='TP' AND account_id=?", (B,)))
+    h.cycle()  # inside the backoff window: no new attempt (bounded retries)
+    check(len(h.j.q("SELECT id FROM orders WHERE leg='TP' AND account_id=?", (B,))) == tp_attempts,
+          "no TP retry inside the backoff window")
+    h.clock.advance(6)  # Phase 2A: retry after bounded backoff (base 5 s)
     h.cycle()
     check(len(h.venue_orders(B, "TAKE_PROFIT_MARKET", "OPEN")) == 1, "TP placed on retry")
+    check(h.ex("t-tpf", B)["tp_coverage"] == "COMPLETE", "coverage restored")
     return {"tp_failure": "degraded + retried; stop kept"}
 
 

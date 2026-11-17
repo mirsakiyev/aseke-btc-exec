@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .auth import MODE_COMPAT, MODE_STRICT, AuthConfig, KeySpec
 from .domain import InstrumentRules, LevelPolicy, PriceRef, ProductType
 from .num import D, s
 
@@ -77,6 +78,11 @@ class ExecutionPolicy:
     max_quote_age_seconds: int = 5
     unknown_resolution_checks: int = 3
     time_exit_overdue_grace_seconds: int = 60
+    # Phase 2A: bounded retry/backoff for degraded (TP / stop-resize) protection work
+    tp_retry_base_seconds: int = 5
+    tp_retry_max_seconds: int = 300
+    tp_escalate_after_failures: int = 5
+    alert_dedup_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -119,8 +125,10 @@ class Config:
     accounts: dict[str, AccountConfig]
     routes: dict[str, tuple[str, ...]]
     sim: SimConfig
+    auth: AuthConfig
     warnings: tuple[str, ...] = ()
     source_hash: str = ""
+    config_path: Path | None = None
 
     @property
     def journal_path(self) -> Path:
@@ -134,9 +142,23 @@ class Config:
     def lock_path(self) -> Path:
         return self.data_dir / "worker.lock"
 
+    @property
+    def sim_lock_path(self) -> Path:
+        return self.data_dir / "sim-harness.lock"
+
+    @property
+    def control_dir(self) -> Path:
+        return self.data_dir / "control"
+
+    @property
+    def heartbeat_path(self) -> Path:
+        return self.data_dir / "heartbeat.json"
+
 
 # ----------------------------------------------------------------- loading
-def load_config(path: str | Path) -> Config:
+def load_config(path: str | Path, data_dir: str | Path | None = None) -> Config:
+    """``data_dir`` (CLI ``--data-dir``) overrides the configured runtime root, so tests,
+    demos and soaks each use an isolated runtime without editing the config file."""
     p = Path(path).resolve()
     if not p.exists():
         raise ConfigError([f"config file not found: {p}"])
@@ -144,7 +166,9 @@ def load_config(path: str | Path) -> Config:
         data = tomllib.loads(p.read_text(encoding="utf-8"), parse_float=Decimal)
     except tomllib.TOMLDecodeError as e:
         raise ConfigError([f"invalid TOML: {e}"]) from None
-    return config_from_dict(data, p.parent)
+    cfg = config_from_dict(data, p.parent, data_dir_override=data_dir)
+    object.__setattr__(cfg, "config_path", p)
+    return cfg
 
 
 def _canon(o: Any) -> Any:
@@ -155,7 +179,8 @@ def _canon(o: Any) -> Any:
     raise TypeError(type(o).__name__)
 
 
-def config_from_dict(data: dict[str, Any], base_dir: Path) -> Config:
+def config_from_dict(data: dict[str, Any], base_dir: Path,
+                     data_dir_override: str | Path | None = None) -> Config:
     problems: list[str] = []
     warnings: list[str] = []
 
@@ -187,7 +212,8 @@ def config_from_dict(data: dict[str, Any], base_dir: Path) -> Config:
     elif mode != "simulation":
         problems.append(f"mode must be 'simulation' (got {data.get('mode')!r})")
 
-    data_dir = (base_dir / str(data.get("data_dir", "var"))).resolve()
+    data_dir = (Path(data_dir_override).resolve() if data_dir_override is not None
+                else (base_dir / str(data.get("data_dir", "var"))).resolve())
     worker = data.get("worker", {}) or {}
     poll = worker.get("poll_interval_seconds", 2)
     poll = float(D(str(poll))) if not isinstance(poll, (int, float)) else float(poll)
@@ -216,7 +242,12 @@ def config_from_dict(data: dict[str, Any], base_dir: Path) -> Config:
         max_quote_age_seconds=int(ex.get("max_quote_age_seconds", 5)),
         unknown_resolution_checks=max(1, int(ex.get("unknown_resolution_checks", 3))),
         time_exit_overdue_grace_seconds=int(ex.get("time_exit_overdue_grace_seconds", 60)),
+        tp_retry_base_seconds=max(1, int(ex.get("tp_retry_base_seconds", 5))),
+        tp_retry_max_seconds=max(1, int(ex.get("tp_retry_max_seconds", 300))),
+        tp_escalate_after_failures=max(1, int(ex.get("tp_escalate_after_failures", 5))),
+        alert_dedup_seconds=max(0, int(ex.get("alert_dedup_seconds", 300))),
     )
+    auth = _parse_auth(data.get("auth"), base_dir, problems, warnings)
 
     # ---- simulator
     simd = data.get("sim", {}) or {}
@@ -345,4 +376,61 @@ def config_from_dict(data: dict[str, Any], base_dir: Path) -> Config:
     return Config(mode="simulation", base_dir=base_dir, data_dir=data_dir,
                   poll_interval_seconds=poll, reconcile_every_cycles=max(1, rec_every),
                   signals=signals, execution=execution, accounts=accounts, routes=routes,
-                  sim=sim, warnings=tuple(warnings), source_hash=src_hash)
+                  sim=sim, auth=auth, warnings=tuple(warnings), source_hash=src_hash)
+
+
+def _parse_auth(ad: Any, base_dir: Path, problems: list[str], warnings: list[str]) -> AuthConfig:
+    """``[auth]`` is mandatory and must name its mode explicitly - there is no implicit
+    unsigned default and strict mode never falls back to unsigned acceptance."""
+    if not isinstance(ad, dict) or "mode" not in ad:
+        problems.append("auth.mode must be set explicitly: 'strict' or "
+                        f"'{MODE_COMPAT}' (unsigned simulation fixtures only)")
+        return AuthConfig(mode=MODE_STRICT, audience="", keys={})
+    mode = str(ad["mode"])
+    if mode not in (MODE_STRICT, MODE_COMPAT):
+        problems.append(f"auth.mode {mode!r} must be 'strict' or '{MODE_COMPAT}'")
+    audience = str(ad.get("audience", ""))
+    keys: dict[str, KeySpec] = {}
+    for kd in ad.get("keys", []) or []:
+        kid = str(kd.get("key_id", ""))
+        where = f"auth.keys[{kid or '?'}]"
+        if not kid or kid in keys:
+            problems.append(f"{where}: missing or duplicate key_id")
+            continue
+        if "secret" in kd or "key" in kd or "secret_hex" in kd:
+            problems.append(f"{where}: key material must never be stored in the config file; "
+                            "use secret_env or secret_file")
+        senv, sfile = kd.get("secret_env"), kd.get("secret_file")
+        if bool(senv) == bool(sfile):
+            problems.append(f"{where}: set exactly one of secret_env / secret_file")
+        envs = frozenset(str(e) for e in kd.get("environments", ["SIMULATION"]))
+        if envs != {"SIMULATION"}:
+            problems.append(f"{where}: only SIMULATION may be authorized in Phase 2A (live refused)")
+        status = str(kd.get("status", "active"))
+        if status not in ("active", "revoked"):
+            problems.append(f"{where}: status must be active or revoked")
+        strategies = frozenset(str(x) for x in kd.get("strategies", []))
+        if not strategies:
+            problems.append(f"{where}: strategies must list the strategy ids this key may sign")
+        keys[kid] = KeySpec(
+            key_id=kid, producer=str(kd.get("producer", "")), strategies=strategies,
+            environments=envs, audiences=frozenset(str(x) for x in kd.get("audiences", [audience])),
+            status=status, secret_env=str(senv) if senv else None,
+            secret_file=(base_dir / str(sfile)).resolve() if sfile else None)
+    if mode == MODE_STRICT:
+        if not audience:
+            problems.append("auth.audience (this executor's identity) is required in strict mode")
+        if not any(k.active for k in keys.values()):
+            problems.append("strict mode requires at least one active key")
+    else:
+        warnings.append(f"auth.mode={MODE_COMPAT}: unsigned events are accepted (simulation "
+                        "fixtures only); producer names are NOT authentication")
+    signer = (ad.get("signer") or {}).get("key_id")
+    if signer is not None and str(signer) not in keys:
+        problems.append(f"auth.signer.key_id {signer!r} is not a configured key")
+    return AuthConfig(
+        mode=mode, audience=audience, keys=keys,
+        max_future_skew_seconds=int(ad.get("max_future_skew_seconds", 5)),
+        max_open_issued_age_seconds=int(ad.get("max_open_issued_age_seconds", 120)),
+        max_exit_issued_age_seconds=int(ad.get("max_exit_issued_age_seconds", 86400)),
+        signer_key_id=str(signer) if signer else None)

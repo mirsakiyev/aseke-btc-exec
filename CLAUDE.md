@@ -9,10 +9,16 @@ simulation-only boundary, confirmed trading behaviour, ECC usage). Non-negotiabl
 2. Simulation only. Live mode must fail before any order-capable activity. No real
    credentials, venues, services or scheduled tasks.
 3. Do not touch the `aseke-btc-lab` repository or its database.
-4. Use available ECC capabilities after checking they exist; don't change global ECC config.
+4. Use available ECC capabilities after checking they exist; don't change global ECC config,
+   don't disable hooks, and describe actions accurately when a hook asks for facts.
+5. Every test/demo/soak/restore uses its own `--data-dir runtime\<name>`; never delete `var\`
+   or SQLite sidecars; only the worker writes the journal (WAL-reset-bug mitigation).
+6. Keys never in config/logs/journal/CLI args; strict auth never falls back to unsigned.
 
 Key paths: `src/aseke_exec/engine.py` (lifecycle), `planning.py` (pure math),
 `contract.py` (signal v1 parser), `sim.py` (persistent simulator + adapter),
-`journal.py` (SQLite ledger), `scenarios.py` (acceptance scenarios), `docs/`.
+`journal.py` (SQLite ledger), `scenarios.py` (acceptance scenarios), `auth.py` (HMAC envelope),
+`ops.py` (health/backup/restore/runtime-info), `soak.py`, `faults.py` (crash points), `docs/`
+(runbook.md, signal-envelope.md, phase2a-acceptance-report.md).
 
 Commands: `.venv\Scripts\python -m pytest` · `.\scripts\aseke-exec.ps1 scenario run all`

@@ -37,7 +37,7 @@ from .domain import Direction, InstrumentRules, MarginMode, PriceRef, Side
 from .num import ZERO, D, ceil_to_step, floor_to_step, is_multiple, quantize_fee, s
 
 FAULT_OPS = ("place_entry", "place_protective", "place_stop", "place_tp", "place_close", "amend",
-             "cancel", "get_order", "set_margin", "quote")
+             "cancel", "get_order", "set_margin", "quote", "trigger")
 FAULT_MODES = ("REJECT", "TIMEOUT_BEFORE_ACCEPT", "TIMEOUT_AFTER_ACCEPT", "NO_FILL", "PARTIAL",
                "SHIFT_BOOK", "STALE_NOT_FOUND", "DUPLICATE_FILLS")
 
@@ -102,7 +102,11 @@ class SimExchange:
         self.clock = clock
         self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=10)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        # Rollback-journal (DELETE) mode, not WAL: the simulator is written by the worker AND by
+        # the operator/test harness (`sim set-market`, fault arming) from other processes. With
+        # the embedded SQLite affected by the WAL-reset bug (< 3.51.3 / 3.50.7 / 3.44.6), WAL
+        # with multiple writer connections is avoided. Busy waits are bounded by `timeout`.
+        self.conn.execute("PRAGMA journal_mode=DELETE")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(_SCHEMA)
 
@@ -569,12 +573,20 @@ class SimExchange:
                     c.execute("UPDATE orders SET status='CANCELLED', updated_at=? WHERE id=?", (now, o["id"]))
                     continue
                 q = min(D(o["qty"]), pos["qty"])
+                f = c.execute("SELECT * FROM faults WHERE venue=? AND (account IS NULL OR account=?) AND "
+                              "op='trigger' AND remaining>0 ORDER BY id LIMIT 1",
+                              (venue, o["account"])).fetchone()
+                status = "FILLED"
+                if f is not None and f["mode"] == "PARTIAL":  # triggered exit only partially fills
+                    c.execute("UPDATE faults SET remaining=remaining-1 WHERE id=?", (f["id"],))
+                    q = max(rules.qty_step, floor_to_step(q * D(f["param"] or "0.5"), rules.qty_step))
+                    status = "CANCELLED"  # remainder of the triggered market order cancelled
                 book = bids if o["side"] == "SELL" else asks
                 for px, fq in self._walk(book, q, lambda p: True, extend=True, fallback=ref):
                     self._fill(c, venue, o["account"], symbol, o["id"], o["client_order_id"],
                                o["side"], fq, px, rules, pos["leverage"] or 1, pos["mode"],
                                D(v["taker_fee_rate"]), reduce=True)
-                c.execute("UPDATE orders SET status='FILLED', updated_at=? WHERE id=?", (now, o["id"]))
+                c.execute("UPDATE orders SET status=?, updated_at=? WHERE id=?", (status, now, o["id"]))
                 fired += 1
             self._store_book(c, venue, symbol, bids, asks)
         return fired

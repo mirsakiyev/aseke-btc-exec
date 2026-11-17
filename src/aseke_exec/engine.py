@@ -15,6 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -33,6 +35,8 @@ from .domain import (
     Direction, Environment, Event, EventType, ExitSpec, HoldingRule, InstrumentRules, LevelPolicy,
     MarginMode, PriceRef, Side,
 )
+from .auth import Authenticator, AuthRejection
+from .faults import crashpoint
 from .inbox import Inbox
 from .journal import Journal, parse_ts
 from .num import ZERO, D, s
@@ -108,6 +112,14 @@ class Engine:
         self.ready: set[str] = set()
         self.started = False
         self.cycles = 0
+        self.auth = Authenticator(config.auth, clock)
+        self._alert_seen: dict[tuple[Any, ...], tuple[float, int]] = {}
+        self._acct_errors: dict[str, int] = {}
+        # Operational metrics for heartbeat/health (not trading state).
+        self.metrics: dict[str, Any] = {"last_cycle_started_at": None, "last_cycle_completed_at": None,
+                                        "last_cycle_ms": None, "cycle_errors": 0,
+                                        "last_stage_errors": {}, "last_reconcile_at": {},
+                                        "quote_age_seconds": {}, "held_files": 0}
         self._register_accounts(config)
 
     # ============================================================ configuration
@@ -152,14 +164,35 @@ class Engine:
         return bool(busy or live or self.j.open_incidents(account_id))
 
     def apply_config(self, cfg: Config) -> None:
-        """Hot reload. Affects future entries only; existing executions keep their snapshot."""
+        """Hot reload. Affects future entries only; existing executions keep their snapshot.
+        The authentication profile (mode / audience) can only change with a worker restart."""
+        if (cfg.auth.mode, cfg.auth.audience) != (self.cfg.auth.mode, self.cfg.auth.audience):
+            from .config import ConfigError
+            self.alert("CRITICAL", "AUTH_PROFILE_CHANGE_REFUSED",
+                       f"hot reload tried to change auth mode/audience {self.cfg.auth.mode}->{cfg.auth.mode}; "
+                       "refused (restart the worker deliberately to change the auth profile)")
+            raise ConfigError(["auth.mode/audience changes require a worker restart (hot reload refused)"])
         self._register_accounts(cfg)
         self.cfg = cfg
+        self.auth = Authenticator(cfg.auth, self.clock)
 
     # ============================================================ alerts/incidents
     def alert(self, level: str, code: str, message: str, account_id: str | None = None,
               trade_id: str | None = None, **detail: Any) -> None:
         now = self.clock.now()
+        # Anti-flood: an identical alert within the dedup window is counted, not re-emitted.
+        key = (level, code, account_id, trade_id, message)
+        window = self.cfg.execution.alert_dedup_seconds
+        mono = now.timestamp()
+        seen = self._alert_seen.get(key)
+        if seen is not None and window > 0 and mono - seen[0] < window:
+            self._alert_seen[key] = (seen[0], seen[1] + 1)
+            return
+        if seen is not None and seen[1]:
+            detail = dict(detail, suppressed_repeats=seen[1])
+        self._alert_seen[key] = (mono, 0)
+        if len(self._alert_seen) > 5000:
+            self._alert_seen.clear()
         self.j.insert("alerts", ts=now, level=level, code=code, account_id=account_id,
                       trade_id=trade_id, message=message, detail=detail)
         rec = {"ts": iso(now), "level": level, "code": code, "account_id": account_id,
@@ -194,16 +227,54 @@ class Engine:
 
     # ============================================================ cycle
     def run_cycle(self) -> dict[str, Any]:
+        """Stages are isolated: a failure in ingestion or event processing (e.g. a locked or
+        failing journal, an unwritable archive) never prevents management of existing exposure."""
+        t0 = time.perf_counter()
+        self.metrics["last_cycle_started_at"] = iso(self.clock.now())
+        self._acct_errors = {}
+        errors: dict[str, str] = {}
         if not self.started:
             self.startup_reconcile()
-        ingested = self.ingest() if self.inbox else []
-        self.process_events()
-        self.manage_all()
+        ingested: list[dict[str, Any]] = []
+        for name, fn in (("ingest", self.ingest if self.inbox else None),
+                         ("events", self.process_events), ("manage", self.manage_all),
+                         ("quotes", self._probe_quotes)):
+            if fn is None:
+                continue
+            try:
+                res = fn()
+                if name == "ingest":
+                    ingested = res  # type: ignore[assignment]
+            except Exception as e:  # noqa: BLE001 - recorded, cycle continues with next stage
+                log.exception("cycle stage %s failed", name)
+                errors[name] = repr(e)
         self.cycles += 1
         if self.cycles % self.cfg.reconcile_every_cycles == 0:
             for aid in list(self.cfg.accounts):
-                self._reconcile_account(aid, kind="PERIODIC")
-        return {"cycle": self.cycles, "ingested": ingested}
+                try:
+                    self._reconcile_account(aid, kind="PERIODIC")
+                except Exception as e:  # noqa: BLE001
+                    errors[f"reconcile:{aid}"] = repr(e)
+        self.metrics["last_stage_errors"] = errors
+        if errors:
+            self.metrics["cycle_errors"] += 1
+        self.metrics["last_cycle_completed_at"] = iso(self.clock.now())
+        self.metrics["last_cycle_ms"] = round((time.perf_counter() - t0) * 1000, 3)
+        return {"cycle": self.cycles, "ingested": ingested, "errors": errors}
+
+    def _probe_quotes(self) -> None:
+        """Record per-account reference-quote age (health evidence; not a trading decision)."""
+        for aid, acct in self.cfg.accounts.items():
+            adapter = self.adapters.get(aid)
+            sym = next(iter(acct.instruments.values()), None)
+            if adapter is None or sym is None:
+                continue
+            try:
+                ts = adapter.reference_prices(sym).ts
+                self.metrics["quote_age_seconds"][aid] = round((self.clock.now() - ts).total_seconds(), 3)
+            except AdapterError as e:
+                self.metrics["quote_age_seconds"][aid] = None
+                self.alert("WARNING", "QUOTE_UNAVAILABLE", f"{aid}: {e}", aid)
 
     def startup_reconcile(self) -> dict[str, str]:
         """Reconcile every account BEFORE enabling new entries."""
@@ -242,6 +313,7 @@ class Engine:
                           wallet=bal.wallet, available=bal.available)
             self.j.insert("reconciliations", ts=now, account_id=aid, kind=kind,
                           result="FINDINGS" if findings else "OK", detail={"findings": findings})
+            self.metrics["last_reconcile_at"][aid] = iso(now)
             self.ready.add(aid)
             return "FINDINGS" if findings else "OK"
         except AdapterError as e:
@@ -261,22 +333,77 @@ class Engine:
     def ingest(self) -> list[dict[str, Any]]:
         assert self.inbox is not None
         out = []
+        held = 0
         for path in self.inbox.pending():
             try:
-                text = path.read_text(encoding="utf-8")
+                data = path.read_bytes()
             except OSError as e:  # being written / locked: retry next scan
                 log.warning("cannot read %s: %s", path, e)
                 continue
-            out.append(self.ingest_text(text, path.name, path))
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                self._reject_file(path, R.INVALID_JSON, "file is not valid UTF-8", data)
+                out.append({"file": path.name, "outcome": "INVALID", "code": str(R.INVALID_JSON)})
+                continue
+            try:
+                res = self.ingest_text(text, path.name, path)
+            except sqlite3.Error:
+                raise  # journal unavailable: stop ingestion this cycle (nothing consumed)
+            except Exception as e:  # noqa: BLE001 - never let one file stall the inbox
+                log.exception("ingest of %s failed", path.name)
+                self._reject_file(path, R.INVALID_JSON, f"unprocessable input: {type(e).__name__}", data)
+                res = {"file": path.name, "outcome": "INVALID", "code": str(R.INVALID_JSON)}
+            held += int(res.get("outcome") == "HELD")
+            out.append(res)
+        self.metrics["held_files"] = held
         return out
+
+    def _reject_file(self, path: Path, code: R, message: str, data: bytes) -> None:
+        self.j.insert("ingest_log", ts=self.clock.now(), file_name=path.name,
+                      file_hash=hashlib.sha256(data).hexdigest(), event_id=None, outcome="INVALID",
+                      code=str(code), message=message, raw_text=None)
+        self.alert("WARNING", "SIGNAL_INVALID", f"{path.name}: {code} {message}")
+        self._move_file("quarantine", path, str(code), message)
+
+    def _move_file(self, op: str, path: Path, *args: str) -> None:
+        """Archive/quarantine AFTER journaling. A failed move is reported, never fatal: the
+        file is re-scanned and recognised as a duplicate of the journaled event."""
+        assert self.inbox is not None
+        try:
+            if op == "archive":
+                self.inbox.archive(path)
+            else:
+                self.inbox.quarantine(path, *args)
+        except OSError as e:
+            self.alert("ERROR", "INBOX_MOVE_FAILED", f"{op} of {path.name} failed: {e}; will retry")
 
     def ingest_text(self, text: str, file_name: str, path: Path | None = None) -> dict[str, Any]:
         """Validate + durably journal. Only then archive/quarantine the file."""
         now = self.clock.now()
         fhash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         raw: dict[str, Any] | None = None
+        # 1) Authentication + authorization BEFORE any event/trade state is created.
         try:
-            raw = load_event_json(text)
+            authr = self.auth.unwrap(text)
+        except AuthRejection as r:
+            if r.hold:  # fail closed without consuming the file (e.g. key not configured)
+                if self.j.q1("SELECT id FROM ingest_log WHERE file_hash=? AND outcome='HELD'", (fhash,)) is None:
+                    self.j.insert("ingest_log", ts=now, file_name=file_name, file_hash=fhash, event_id=None,
+                                  outcome="HELD", code=str(r.code), message=r.message, raw_text=None)
+                self.alert("ERROR", str(r.code), f"{file_name}: {r.message}")
+                return {"file": file_name, "outcome": "HELD", "code": str(r.code)}
+            outcome = ("INVALID" if r.code in (R.INVALID_JSON, R.DUPLICATE_JSON_KEY, R.INVALID_NUMBER)
+                       else "AUTH_REJECTED")
+            self.j.insert("ingest_log", ts=now, file_name=file_name, file_hash=fhash, event_id=None,
+                          outcome=outcome, code=str(r.code), message=r.message,
+                          raw_text=text[:2000])
+            self.alert("WARNING", "SIGNAL_AUTH_REJECTED", f"{file_name}: {r.code} {r.message}")
+            if path and self.inbox:
+                self._move_file("quarantine", path, str(r.code), r.message)
+            return {"file": file_name, "outcome": outcome, "code": str(r.code)}
+        try:
+            raw = load_event_json(json.dumps(authr.payload)) if authr.mode == "HMAC" else load_event_json(text)
             ev = parse_event(raw)
         except Rejection as r:
             eid = raw.get("event_id") if isinstance(raw, dict) and isinstance(raw.get("event_id"), str) else None
@@ -284,7 +411,7 @@ class Engine:
                           outcome="INVALID", code=str(r.code), message=r.message, raw_text=text[:20000])
             self.alert("WARNING", "SIGNAL_INVALID", f"{file_name}: {r.code} {r.message}")
             if path and self.inbox:
-                self.inbox.quarantine(path, str(r.code), r.message)
+                self._move_file("quarantine", path, str(r.code), r.message)
             return {"file": file_name, "outcome": "INVALID", "code": str(r.code)}
         chash = content_hash(raw)
         existing = self.j.event_by_id(ev.event_id)
@@ -300,23 +427,26 @@ class Engine:
                 self.alert("ERROR", str(code), f"event_id {ev.event_id} reused with different content",
                            trade_id=ev.trade_id)
                 if path and self.inbox:
-                    self.inbox.quarantine(path, str(code), "event_id reused with different content")
+                    self._move_file("quarantine", path, str(code), "event_id reused with different content")
             elif path and self.inbox:
-                self.inbox.archive(path)
+                self._move_file("archive", path)
             return {"file": file_name, "outcome": outcome, "event_id": ev.event_id}
         with self.j.tx() as c:
             c.execute(
                 "INSERT INTO events (event_id, content_hash, trade_id, event_type, revision, producer,"
                 " environment, created_at, source_data_time, received_at, source_file, canonical_json,"
-                " process_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'PENDING')",
+                " process_status, auth_mode, auth_key_id, envelope_issued_at, envelope_hash)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'PENDING',?,?,?,?)",
                 (ev.event_id, chash, ev.trade_id, str(ev.event_type), ev.revision, ev.producer_name,
                  str(ev.environment), iso(ev.created_at),
                  iso(ev.source.data_time) if ev.source else None, iso(now), file_name,
-                 canonical_json(raw)))
+                 canonical_json(raw), authr.mode, authr.key_id, iso(authr.issued_at),
+                 authr.envelope_hash))
             c.execute("INSERT INTO ingest_log (ts, file_name, file_hash, event_id, outcome) "
                       "VALUES (?,?,?,?, 'JOURNALED')", (iso(now), file_name, fhash, ev.event_id))
+        crashpoint("after_ingest_commit")
         if path and self.inbox:
-            self.inbox.archive(path)
+            self._move_file("archive", path)
         return {"file": file_name, "outcome": "JOURNALED", "event_id": ev.event_id}
 
     # ============================================================ event application
@@ -327,6 +457,8 @@ class Engine:
                 status, code, msg, defer = self._apply_event(ev, row)
             except Rejection as r:
                 status, code, msg, defer = "REJECTED", r.code, r.message, None
+            except sqlite3.Error:
+                raise  # journal failing: stop event processing (retried next cycle), never continue blind
             except Exception as e:  # never let one event stall the cycle; retried next cycle
                 log.exception("event %s failed", row["event_id"])
                 self.alert("ERROR", str(R.INTERNAL_ERROR), f"event {row['event_id']}: {e!r}; will retry",
@@ -349,8 +481,36 @@ class Engine:
                             f"producer {ev.producer_name!r} is not configured as trusted "
                             "(note: a producer name is not authentication)")
 
+    def _authorization_gate(self, ev: Event, row: dict[str, Any]) -> None:
+        """Policy for already-journaled events whose key was revoked (or mode tightened) since
+        ingestion: commands that authorize or reshape exposure (OPEN, AMEND_EXITS) are refused;
+        CLOSE / CANCEL_ENTRY only reduce exposure and remain applied."""
+        mode = row.get("auth_mode")
+        if mode == "HMAC":
+            spec = self.cfg.auth.keys.get(row.get("auth_key_id") or "")
+            valid = (spec is not None and spec.active and spec.producer == ev.producer_name
+                     and ev.strategy_id in spec.strategies and str(ev.environment) in spec.environments)
+            if valid:
+                return
+            if ev.event_type in (EventType.OPEN, EventType.AMEND_EXITS):
+                raise Rejection(R.AUTH_KEY_REVOKED, "signing key revoked/removed or its scope no longer "
+                                                    "covers this event (re-checked at apply time)")
+            trade = self.j.trade(ev.trade_id)
+            if trade is None or trade["open_event_id"] is None:
+                # exposure-reducing commands from a no-longer-valid key may still close EXISTING
+                # exposure, but must never create a tombstone that blocks a future authorized OPEN
+                raise Rejection(R.AUTH_KEY_REVOKED, "CLOSE/CANCEL from a revoked/out-of-scope key for a "
+                                                    "trade with no OPEN: no tombstone created")
+            return
+        if ev.event_type not in (EventType.OPEN, EventType.AMEND_EXITS):
+            return
+        if self.cfg.auth.mode == "strict":
+            raise Rejection(R.AUTH_REQUIRED, "unsigned event ingested under the compatibility "
+                                             "profile is not applied in strict mode")
+
     def _apply_event(self, ev: Event, row: dict[str, Any]) -> tuple[str, Any, str, Any]:
         self._event_gate(ev)
+        self._authorization_gate(ev, row)
         trade = self.j.trade(ev.trade_id)
         now = self.clock.now()
         if trade is not None and trade["strategy_id"] and trade["strategy_id"] != ev.strategy_id:
@@ -444,7 +604,19 @@ class Engine:
             if trade["status"] == "TOMBSTONED":
                 raise Rejection(R.TRADE_TOMBSTONED,
                                 "a CLOSE/CANCEL_ENTRY for this trade arrived first; OPEN refused")
-            raise Rejection(R.DUPLICATE_OPEN_CONFLICT, "trade already has an OPEN with another event_id")
+            if trade["open_event_id"] != ev.event_id:
+                raise Rejection(R.DUPLICATE_OPEN_CONFLICT,
+                                "trade already has an OPEN with another event_id")
+            # Same OPEN re-processed after an interruption: resume routing to the ORIGINAL
+            # recorded accounts that have no execution yet (each still passes full preflight,
+            # including signal age/expiry). Accounts already handled are never re-entered.
+            done = {e["account_id"] for e in self.j.executions_for_trade(ev.trade_id)}
+            pending = [a for a in (trade["routing"] or []) if a not in done]
+            if trade["status"] != "ACTIVE":
+                pending = []
+            for aid in pending:
+                self._open_for_account_safe(ev, aid)
+            return "APPLIED", None, f"resumed routing for {len(pending)} account(s)", None
         sp = self.cfg.signals
         src_q, tgt_q = ev.source.quote_currency, ev.instrument.quote
         if src_q != tgt_q and (src_q, tgt_q) not in sp.allowed_currency_mappings:
@@ -461,14 +633,19 @@ class Engine:
                       last_revision=1, routing=list(accounts), config_hash=self.cfg.source_hash,
                       created_at=now, updated_at=now)
         for aid in accounts:
-            try:
-                self._open_for_account(ev, aid)
-            except AdapterError as e:
-                self.alert("ERROR", "ADAPTER_ERROR", f"{aid}: {e}", aid, ev.trade_id)
-            except Exception as e:
-                log.exception("OPEN %s for %s failed", ev.trade_id, aid)
-                self.alert("CRITICAL", str(R.INTERNAL_ERROR), f"{aid}: {e!r}", aid, ev.trade_id)
+            self._open_for_account_safe(ev, aid)
         return "APPLIED", None, f"routed to {len(accounts)} account(s)", None
+
+    def _open_for_account_safe(self, ev: Event, aid: str) -> None:
+        try:
+            self._open_for_account(ev, aid)
+        except AdapterError as e:
+            self.alert("ERROR", "ADAPTER_ERROR", f"{aid}: {e}", aid, ev.trade_id)
+        except sqlite3.Error:
+            raise  # local persistence failure: abort the event (retried), never continue blind
+        except Exception as e:
+            log.exception("OPEN %s for %s failed", ev.trade_id, aid)
+            self.alert("CRITICAL", str(R.INTERNAL_ERROR), f"{aid}: {e!r}", aid, ev.trade_id)
 
     def _open_for_account(self, ev: Event, aid: str) -> None:
         assert ev.open is not None
@@ -537,6 +714,18 @@ class Engine:
         return self.j.insert("executions", **base, **fields, state=str(state),
                              reason_code=str(code) if code else None, reason_message=msg)
 
+    def _degraded_reasons(self, aid: str) -> list[str]:
+        """Dynamic entry gate: clears automatically once coverage is restored."""
+        out = []
+        for e in self.j.q("SELECT id, state, stop_coverage, tp_coverage FROM executions WHERE "
+                          "account_id=? AND state IN ('OPEN_UNPROTECTED','OPEN_PROTECTED','CLOSING')",
+                          (aid,)):
+            if e["tp_coverage"] == "DEGRADED":
+                out.append(f"execution {e['id']} TP coverage degraded")
+            if e["stop_coverage"] == "UNVERIFIED":
+                out.append(f"execution {e['id']} stop coverage unverified")
+        return out
+
     def _reserved_sum(self, aid: str) -> Decimal:
         rows = self.j.q("SELECT reserved_amount FROM executions WHERE account_id=? AND state IN "
                         "('RESERVED','ENTRY_SUBMITTED','ENTRY_UNKNOWN')", (aid,))
@@ -562,6 +751,11 @@ class Engine:
             raise Rejection(R.ACCOUNT_DISABLED, "account is disabled for new entries")
         if arow.get("entries_blocked"):
             raise Rejection(R.ACCOUNT_BLOCKED, f"account blocked: {arow.get('block_reason')}")
+        degraded = self._degraded_reasons(aid)
+        if degraded:
+            raise Rejection(R.ACCOUNT_DEGRADED,
+                            "existing exposure on this account is not fully protected/exit-planned: "
+                            + "; ".join(degraded))
         if aid not in self.ready:
             raise Rejection(R.ACCOUNT_NOT_RECONCILED, "account not reconciled since startup")
         if acct.strategy_owner != ev.strategy_id:
@@ -747,6 +941,7 @@ class Engine:
                             trigger_price=trigger_price, trigger_reference=trigger_reference,
                             reduce_only=int(reduce_only), status="INTENT", created_at=now,
                             updated_at=now)
+        crashpoint(f"after_intent:{leg}", f"after_intent:{leg}:v{plan_version}")
         return self.j.order(oid)
 
     def _send(self, order: dict[str, Any], adapter: ExchangeAdapter) -> tuple[str, OrderReport | None]:
@@ -769,6 +964,7 @@ class Engine:
             self.j.insert("submissions", order_id=order["id"], ts=now, op="PLACE", outcome="UNKNOWN",
                           detail={"error": str(e)})
             return "UNKNOWN", None
+        crashpoint(f"after_ack:{order['leg']}", f"after_ack:{order['leg']}:v{order['plan_version']}")
         self.j.insert("submissions", order_id=order["id"], ts=now, op="PLACE", outcome="ACK",
                       detail={"status": str(report.status), "venue_order_id": report.venue_order_id})
         self._apply_report(order, report)
@@ -788,7 +984,7 @@ class Engine:
         self.j.update("orders", "id", order["id"], status=str(report.status),
                       venue_order_id=report.venue_order_id, filled_qty=fq, avg_price=avg,
                       qty=report.qty, trigger_price=report.trigger_price or order["trigger_price"],
-                      updated_at=now)
+                      not_found_checks=0, updated_at=now)
 
     def _sync_order(self, order: dict[str, Any], adapter: ExchangeAdapter) -> dict[str, Any]:
         if order["status"] not in LIVE_ORDER:
@@ -878,7 +1074,17 @@ class Engine:
                                 entry_outcome=outcome, filled_qty=qty, filled_qty_btc=qbtc,
                                 avg_fill=avg, filled_notional=notional, actual_margin=margin,
                                 entry_fees=fees, unused_allocation=ex["requested_margin"] - margin,
-                                reserved_amount=ZERO, first_fill_at=first, deadline_at=deadline)
+                                reserved_amount=ZERO, first_fill_at=first, deadline_at=deadline,
+                                stop_coverage="NONE", tp_coverage="NONE",
+                                unprotected_since=ex["unprotected_since"] or first)
+        if ex["planned_margin"] is not None and margin > ex["planned_margin"]:
+            # Expected for favourable higher-price SHORT fills (a sell floor is not an upper
+            # notional bound) or a book that moved between quote and match. Reported, never
+            # "fixed" by changing leverage, stop or configured capital.
+            self.alert("WARNING", "ACTUAL_MARGIN_ABOVE_PLAN",
+                       f"actual margin {margin} > planned {ex['planned_margin']} "
+                       f"(fill {avg} vs sizing price {ex['sizing_price']})",
+                       ex["account_id"], ex["trade_id"], actual=s(margin), planned=s(ex["planned_margin"]))
         if outcome == "PARTIAL_FILL":
             self.alert("INFO", "ENTRY_PARTIAL_FILL",
                        f"filled {qty}/{ex['planned_qty']}; remainder cancelled, not chased or topped up",
@@ -942,13 +1148,55 @@ class Engine:
         self.j.log_execution(ex["id"], self.clock.now(), "EXIT_PLAN", plan=plan)
 
     # ------------------------------------------------------------ protection
+    def _leg_progress(self, ex: dict[str, Any], plan: dict[str, Any]) -> list[dict[str, Any]]:
+        """Durable per-leg executed/remaining quantities derived from journaled TP fills of the
+        CURRENT plan version (an amended plan starts its own legs; history stays in the log)."""
+        v = int(plan["version"])
+        executed: dict[int, Decimal] = {}
+        for r in self.j.q("SELECT o.leg_index AS idx, f.qty AS qty FROM fills f JOIN orders o ON "
+                          "o.id=f.order_id WHERE f.execution_id=? AND f.leg='TP' AND o.plan_version=?",
+                          (ex["id"], v)):
+            executed[int(r["idx"])] = executed.get(int(r["idx"]), ZERO) + r["qty"]
+        out = []
+        for leg in plan["legs"]:
+            q, e = D(leg["qty"]), executed.get(int(leg["index"]), ZERO)
+            out.append(dict(leg, executed_qty=s(e), remaining_qty=s(max(ZERO, q - e))))
+        return out
+
+    def _mark_unprotected(self, ex: dict[str, Any], coverage: str) -> None:
+        fields: dict[str, Any] = {"stop_coverage": coverage}
+        if not ex["unprotected_since"]:
+            fields["unprotected_since"] = self.clock.now()
+        if ex["stop_coverage"] != coverage or "unprotected_since" in fields:
+            self.j.update_execution(ex["id"], self.clock.now(), **fields)
+
+    def _mark_stop_verified(self, ex: dict[str, Any]) -> None:
+        now = self.clock.now()
+        since = parse_ts(ex["unprotected_since"])
+        if since is not None:
+            dur = Decimal(str(round((now - since).total_seconds(), 3)))
+            prev = ex["max_unprotected_seconds"] or ZERO
+            self.j.log_execution(ex["id"], now, "UNPROTECTED_INTERVAL", seconds=s(dur))
+            self.j.update_execution(ex["id"], now, stop_coverage="VERIFIED", unprotected_since=None,
+                                    max_unprotected_seconds=max(prev, dur))
+        elif ex["stop_coverage"] != "VERIFIED":
+            self.j.update_execution(ex["id"], now, stop_coverage="VERIFIED")
+
+    def _backoff(self, n: int) -> timedelta:
+        ec = self.cfg.execution
+        return timedelta(seconds=min(ec.tp_retry_base_seconds * 2 ** max(0, n - 1), ec.tp_retry_max_seconds))
+
     def _ensure_protection(self, ex: dict[str, Any]) -> None:
-        """Converge exchange-held protection to the desired state for ACTUAL exposure."""
+        """Converge exchange-held protection to the desired state for ACTUAL exposure.
+        Desired vs observed is compared first; venue writes happen only when they differ, so a
+        healthy unchanged position produces no order traffic (no cancel/re-create churn)."""
         adapter = self._adapter(ex)
+        now = self.clock.now()
         for o in self.j.orders_for(ex["id"]):
             if o["leg"] in EXIT_LEGS:
                 self._sync_order(o, adapter)
         pos = adapter.position(ex["native_symbol"])
+        ex = self.j.execution(ex["id"])
         if pos.qty == 0:
             self._handle_flat(ex)
             return
@@ -961,85 +1209,171 @@ class Engine:
         if plan is None:
             return
         v = int(plan["version"])
-        orders = self.j.orders_for(ex["id"])
-        # Protective orders whose state is unresolved (crash intent / missing observation) are
-        # demoted to NOT_ACCEPTED only after the bounded number of not-found checks; until then
-        # no replacement is placed (avoids duplicates from a stale read). A late appearance is
-        # reduce-only and is cancelled by _cancel_strays / the final sync in _handle_flat.
-        waiting = False
-        for o in orders:
+        rules = self._rules(ex)
+        threshold = self.cfg.execution.unknown_resolution_checks
+        # Unresolved protective orders: one missing observation is not proof of absence.
+        pending_stop = False
+        pending_tp: set[int] = set()
+        for o in self.j.orders_for(ex["id"]):
             if o["leg"] in ("STOP", "TP") and o["status"] in UNRESOLVED_ORDER:
-                if o["not_found_checks"] >= self.cfg.execution.unknown_resolution_checks:
-                    self.j.update("orders", "id", o["id"], status="NOT_ACCEPTED", updated_at=self.clock.now())
-                else:
-                    waiting = True
-        if waiting:
-            self.alert("WARNING", "PROTECTION_UNVERIFIED",
-                       "protective order not observed on venue; re-checking before replacing",
-                       ex["account_id"], ex["trade_id"])
-            return
+                if o["not_found_checks"] >= threshold:
+                    self.j.update("orders", "id", o["id"], status="NOT_ACCEPTED", updated_at=now)
+                    self.j.log_execution(ex["id"], now, "ORDER_NOT_ACCEPTED", client_order_id=o["client_order_id"],
+                                         checks=o["not_found_checks"])
+                elif o["leg"] == "STOP":
+                    pending_stop = True
+                elif o["plan_version"] == v:
+                    pending_tp.add(int(o["leg_index"]))
         orders = self.j.orders_for(ex["id"])
         trig_ref = plan["trigger_reference"]
-        stop_px = D(plan["stop"])
         opens = [o for o in orders if o["leg"] == "STOP" and o["status"] == "OPEN"]
         current = [o for o in opens if o["plan_version"] == v]
+        covering = any(o["qty"] >= pos.qty for o in opens)
         if not current:
-            o = self._place_protective(ex, adapter, "STOP", 0, v, OrderKind.STOP_MARKET, pos.qty,
-                                       stop_px, trig_ref)
-            if o is None:
+            if pending_stop:
+                if covering:
+                    self._mark_stop_verified(ex)
+                else:
+                    self._mark_unprotected(ex, "UNVERIFIED")
+                self.alert("WARNING", "PROTECTION_UNVERIFIED",
+                           "stop placement outcome not yet observed on venue; re-checking (bounded) "
+                           "before any replacement", ex["account_id"], ex["trade_id"])
                 return
-            current = [o]
+            ok, o = self._place_protective(ex, adapter, "STOP", 0, v, OrderKind.STOP_MARKET, pos.qty,
+                                           D(plan["stop"]), trig_ref)
+            if not ok:
+                if o is not None and o["status"] in UNRESOLVED_ORDER:
+                    if covering:
+                        self._mark_stop_verified(self.j.execution(ex["id"]))
+                    else:
+                        self._mark_unprotected(self.j.execution(ex["id"]), "UNVERIFIED")
+                return
+            current = [o]  # type: ignore[list-item]
         else:
-            if current[0]["qty"] != pos.qty and not self._resize_stop(ex, adapter, current[0], pos.qty):
-                return
+            exact = [o for o in current if o["qty"] == pos.qty]
+            st = exact[-1] if exact else current[-1]  # best fit, newest first
+            current = [st] + [o for o in current if o["id"] != st["id"]]
+            if st["qty"] < pos.qty:  # stop smaller than exposure: coverage NOT verified - fix now
+                if not self._resize_stop(ex, adapter, st, pos.qty):
+                    self._protection_failure(ex, f"stop {st['qty']} smaller than exposure {pos.qty} "
+                                                 "and could not be resized")
+                    return
+            elif st["qty"] > pos.qty:  # oversize reduce-only stop still covers: cosmetic, bounded retry
+                retry_at = parse_ts(ex["stop_fix_retry_at"])
+                if retry_at is None or now >= retry_at:
+                    if self._resize_stop(ex, adapter, st, pos.qty):
+                        self.j.update_execution(ex["id"], now, stop_fix_retry_at=None)
+                    else:
+                        self.j.update_execution(ex["id"], now, stop_fix_retry_at=now + self._backoff(2))
+                        self.alert("WARNING", "STOP_RESIZE_DEFERRED",
+                                   f"stop qty {st['qty']} > position {pos.qty}; reduce-only stop still "
+                                   "covers the exposure; resize retried later", ex["account_id"], ex["trade_id"])
             for extra in current[1:]:
                 self._cancel(extra, adapter)
         for o in opens:
-            if o["plan_version"] != v:  # cancel only after the new stop is verified
+            if o["plan_version"] != v:  # only after the current-version stop is verified OPEN
                 self._cancel(o, adapter)
-        orders = self.j.orders_for(ex["id"])
-        for leg in plan["legs"]:
-            i = int(leg["index"])
-            mine = [o for o in orders if o["leg"] == "TP" and o["leg_index"] == i and o["plan_version"] == v]
-            if any(o["filled_qty"] > 0 and o["status"] not in LIVE_ORDER for o in mine):
-                continue
-            if any(o["status"] == "OPEN" for o in mine):
-                continue
-            q = min(D(leg["qty"]), pos.qty)
-            if self._place_protective(ex, adapter, "TP", i, v, OrderKind.TAKE_PROFIT_MARKET, q,
-                                      D(leg["price"]), trig_ref, mandatory=False) is None:
-                continue  # stop is verified; TP retried next cycle (alerted)
-        for o in orders:
+        ex = self.j.execution(ex["id"])
+        self._mark_stop_verified(ex)
+        ex = self.j.execution(ex["id"])
+        # ---- take-profit legs (stop already verified: failures are DEGRADED, never a forced close)
+        for o in self.j.orders_for(ex["id"]):
             if o["leg"] == "TP" and o["status"] == "OPEN" and o["plan_version"] != v:
                 self._cancel(o, adapter)
+        pos = adapter.position(ex["native_symbol"])  # re-read: an old TP may have filled meanwhile
+        if pos.qty == 0:
+            self._handle_flat(self.j.execution(ex["id"]))
+            return
+        progress = self._leg_progress(ex, plan)
+        complete, failed = True, False
+        retry_at = parse_ts(ex["tp_retry_at"])
+        orders = self.j.orders_for(ex["id"])
+        budget = pos.qty - sum((o["qty"] for o in orders if o["leg"] == "TP" and o["status"] == "OPEN"
+                                and o["plan_version"] == v), ZERO)
+        for leg in progress:
+            i = int(leg["index"])
+            mine = [o for o in orders if o["leg"] == "TP" and o["leg_index"] == i and o["plan_version"] == v]
+            if any(o["status"] == "OPEN" for o in mine):
+                continue
+            if i in pending_tp:
+                complete = False
+                continue
+            rem = min(D(leg["remaining_qty"]), pos.qty, max(budget, ZERO))
+            if rem <= 0 or rem < rules.min_qty:
+                continue  # leg done (or residual below venue minimum: covered by the stop)
+            if retry_at is not None and now < retry_at:
+                complete = False
+                continue
+            ok, o = self._place_protective(ex, adapter, "TP", i, v, OrderKind.TAKE_PROFIT_MARKET, rem,
+                                           D(leg["price"]), trig_ref, mandatory=False)
+            if ok:
+                budget -= rem
+            if not ok:
+                complete = False
+                failed = failed or not (o is not None and o["status"] in UNRESOLVED_ORDER)
         self._cancel_strays(ex, adapter)
+        new_plan = dict(plan, legs=self._leg_progress(ex, plan))
+        if new_plan != plan:
+            self.j.update_execution(ex["id"], now, exit_plan=new_plan)
+        self._update_tp_coverage(self.j.execution(ex["id"]), complete, failed)
+        ex = self.j.execution(ex["id"])
         if ExecState(ex["state"]) is not ExecState.OPEN_PROTECTED or ex["protected_qty"] != pos.qty:
-            self.j.update_execution(ex["id"], self.clock.now(), state=str(ExecState.OPEN_PROTECTED),
-                                    protected_qty=pos.qty)
-            self.j.log_execution(ex["id"], self.clock.now(), "PROTECTED", qty=s(pos.qty), plan_version=v)
+            self.j.update_execution(ex["id"], now, state=str(ExecState.OPEN_PROTECTED), protected_qty=pos.qty)
+            self.j.log_execution(ex["id"], now, "PROTECTED", qty=s(pos.qty), plan_version=v)
+
+    def _update_tp_coverage(self, ex: dict[str, Any], complete: bool, failed: bool) -> None:
+        now = self.clock.now()
+        if complete:
+            if ex["tp_coverage"] != "COMPLETE" or ex["tp_fail_count"]:
+                if ex["tp_coverage"] == "DEGRADED":
+                    self.alert("INFO", "TP_COVERAGE_RESTORED", "take-profit coverage complete again",
+                               ex["account_id"], ex["trade_id"])
+                self.j.update_execution(ex["id"], now, tp_coverage="COMPLETE", tp_fail_count=0, tp_retry_at=None)
+                with self.j.tx() as c:
+                    c.execute("UPDATE incidents SET status='RESOLVED', resolved_at=?, resolution=? WHERE "
+                              "status='OPEN' AND execution_id=? AND kind=?",
+                              (iso(now), "TP coverage restored", ex["id"], str(R.TP_PLACEMENT_PERSISTENT)))
+            return
+        fields: dict[str, Any] = {"tp_coverage": "DEGRADED"}
+        if failed:
+            n = int(ex["tp_fail_count"] or 0) + 1
+            fields.update(tp_fail_count=n, tp_retry_at=now + self._backoff(n))
+            if n == 1:
+                self.alert("WARNING", "TP_DEGRADED",
+                           "take-profit placement failed; stop coverage verified, position retained; "
+                           "new entries on this account are gated until restored", ex["account_id"], ex["trade_id"])
+            if n == self.cfg.execution.tp_escalate_after_failures:
+                self.incident(R.TP_PLACEMENT_PERSISTENT, ex["account_id"], ex["id"],
+                              f"take-profit placement failed {n} times (bounded backoff); stop-protected, "
+                              "operator attention required", block=False)
+        self.j.update_execution(ex["id"], now, **fields)
 
     def _place_protective(self, ex: dict[str, Any], adapter: ExchangeAdapter, leg: str, idx: int,
                           version: int, kind: OrderKind, qty: Decimal, trigger: Decimal,
-                          trig_ref: str, mandatory: bool = True) -> dict[str, Any] | None:
+                          trig_ref: str, mandatory: bool = True) -> tuple[bool, dict[str, Any] | None]:
+        """Returns (verified_open, order). A timeout whose single immediate re-query does not
+        find the order leaves it UNKNOWN (bounded re-checks next cycles) - it is neither treated
+        as absent nor resubmitted under a new identity."""
         order = self._create_order(ex, leg, idx, version, kind, Direction(ex["direction"]).exit_side,
                                    qty, trigger_price=trigger, trigger_reference=trig_ref,
                                    reduce_only=True)
         outcome, _ = self._send(order, adapter)
-        if outcome == "UNKNOWN":  # verify immediately; never assume
+        if outcome == "UNKNOWN":
             order = self._sync_order(self.j.order(order["id"]), adapter)
-            outcome = "ACK" if order["status"] == "OPEN" else "UNVERIFIED"
         order = self.j.order(order["id"])
-        if outcome != "ACK" or order["status"] != "OPEN":
-            if order["status"] in UNRESOLVED_ORDER:
-                self.j.update("orders", "id", order["id"], status="NOT_ACCEPTED", updated_at=self.clock.now())
-            detail = f"{leg} placement {outcome} ({order.get('reject_reason')})"
-            if mandatory:
-                self._protection_failure(ex, detail)
-            else:
-                self.alert("WARNING", "TP_PLACEMENT_FAILED",
-                           f"{detail}; stop remains verified, will retry", ex["account_id"], ex["trade_id"])
-            return None
-        return order
+        if order["status"] == "OPEN":
+            return True, order
+        if order["status"] in UNRESOLVED_ORDER:
+            self.alert("WARNING", "PROTECTION_UNVERIFIED",
+                       f"{leg} placement outcome unknown; re-checking by client id", ex["account_id"], ex["trade_id"])
+            return False, order
+        detail = f"{leg} placement {outcome}/{order['status']} ({order.get('reject_reason')})"
+        if mandatory:
+            self._protection_failure(ex, detail)
+        else:
+            self.alert("WARNING", "TP_PLACEMENT_FAILED", f"{detail}; stop remains verified, retry with backoff",
+                       ex["account_id"], ex["trade_id"])
+        return False, order
 
     def _resize_stop(self, ex: dict[str, Any], adapter: ExchangeAdapter, stop: dict[str, Any],
                      qty: Decimal) -> bool:
@@ -1054,11 +1388,12 @@ class Engine:
                 if refreshed["status"] == "OPEN" and refreshed["qty"] == qty:
                     return True
                 self.alert("WARNING", "STOP_AMEND_FAILED", str(e), ex["account_id"], ex["trade_id"])
-        # place-new-then-cancel-old: reduce-only means overlap cannot reverse exposure
-        new = self._place_protective(ex, adapter, "STOP", 0, int(stop["plan_version"]),
-                                     OrderKind.STOP_MARKET, qty, stop["trigger_price"],
-                                     stop["trigger_reference"])
-        if new is None:
+        # place-new-then-cancel-old: reduce-only means overlap cannot reverse exposure. The old
+        # stop stays in place (still covering) if the replacement cannot be verified.
+        ok, _ = self._place_protective(ex, adapter, "STOP", 0, int(stop["plan_version"]),
+                                       OrderKind.STOP_MARKET, qty, stop["trigger_price"],
+                                       stop["trigger_reference"], mandatory=False)
+        if not ok:
             return False
         self._cancel(stop, adapter)
         return True
@@ -1077,7 +1412,10 @@ class Engine:
         mine = {o["client_order_id"]: o for o in self.j.orders_for(ex["id"])}
         for rep in adapter.open_orders(ex["native_symbol"]):
             o = mine.get(rep.client_order_id)
-            if o is not None and o["status"] in ("NOT_ACCEPTED", "UNKNOWN", "INTENT"):
+            if o is not None and o["status"] in UNRESOLVED_ORDER:
+                self._apply_report(o, rep)  # it exists: record it, do not cancel inside the window
+                continue
+            if o is not None and o["status"] == "NOT_ACCEPTED":
                 try:
                     self._apply_report(o, adapter.cancel_order(ex["native_symbol"], rep.client_order_id))
                 except AdapterError:
@@ -1148,26 +1486,41 @@ class Engine:
         self._ensure_closing_stop(self.j.execution(ex["id"]), adapter, pos)
 
     def _ensure_closing_stop(self, ex: dict[str, Any], adapter: ExchangeAdapter, pos: Position) -> None:
-        """Exposure still open while CLOSING must not be left without a stop."""
+        """Exposure still open while CLOSING must not be left without a stop. If one cannot be
+        placed, a durable UNPROTECTED_EXPOSURE incident is raised - requesting an order is never
+        reported as coverage."""
+        threshold = self.cfg.execution.unknown_resolution_checks
+        for o in self.j.orders_for(ex["id"]):
+            if o["leg"] == "STOP" and o["status"] in UNRESOLVED_ORDER and o["not_found_checks"] >= threshold:
+                self.j.update("orders", "id", o["id"], status="NOT_ACCEPTED", updated_at=self.clock.now())
         orders = self.j.orders_for(ex["id"])
-        if any(o["leg"] == "STOP" and o["status"] in LIVE_ORDER for o in orders):
+        if any(o["leg"] == "STOP" and o["status"] == "OPEN" and o["qty"] >= pos.qty for o in orders):
+            self._mark_stop_verified(ex)
             return
+        if any(o["leg"] == "STOP" and o["status"] in UNRESOLVED_ORDER for o in orders):
+            self._mark_unprotected(ex, "UNVERIFIED")  # bounded re-check before any replacement
+            return
+        # an OPEN but undersized stop is not full coverage: mark and add a covering stop below
         plan = ex["exit_plan"]
         spec = ExitSpec.from_dict(ex["exit_spec"]) if ex["exit_spec"] else None
         stop = D(plan["stop"]) if plan else (spec.stop_price if spec else None)
         ref = plan["trigger_reference"] if plan else (str(spec.trigger_reference) if spec else "LAST")
         if stop is None:
-            self.alert("CRITICAL", "UNPROTECTED_WHILE_CLOSING",
-                       "close not yet complete and no stop level is available", ex["account_id"], ex["trade_id"])
+            self._mark_unprotected(ex, "NONE")
+            self.incident(R.UNPROTECTED_EXPOSURE, ex["account_id"], ex["id"],
+                          "close not yet complete and no stop level is available")
             return
         order = self._create_order(ex, "STOP", 0, int(plan["version"]) if plan else 0,
                                    OrderKind.STOP_MARKET, Direction(ex["direction"]).exit_side, pos.qty,
                                    trigger_price=stop, trigger_reference=ref, reduce_only=True)
         outcome, _ = self._send(order, adapter)
-        if outcome != "ACK" or self.j.order(order["id"])["status"] != "OPEN":
-            self.alert("CRITICAL", "UNPROTECTED_WHILE_CLOSING",
-                       f"close incomplete and stop placement {outcome}; retrying close next cycle",
-                       ex["account_id"], ex["trade_id"])
+        if outcome == "ACK" and self.j.order(order["id"])["status"] == "OPEN":
+            self._mark_stop_verified(self.j.execution(ex["id"]))
+            return
+        self._mark_unprotected(self.j.execution(ex["id"]), "NONE" if outcome == "REJECTED" else "UNVERIFIED")
+        self.incident(R.UNPROTECTED_EXPOSURE, ex["account_id"], ex["id"],
+                      f"close incomplete and stop placement {outcome}; exposure NOT stop-protected; "
+                      "close retried next cycle")
 
     def _sync_any(self, order: dict[str, Any], adapter: ExchangeAdapter) -> None:
         """Query an order regardless of local status and journal whatever the venue reports."""
@@ -1192,6 +1545,7 @@ class Engine:
                                ex["account_id"], ex["trade_id"])
                     return
         self._cancel_strays(ex, adapter)
+        crashpoint("before_close_accounting")
         rules = self._rules(ex)
         direction = Direction(ex["direction"])
         exits = self.j.fills_for(ex["id"], EXIT_LEGS)
@@ -1215,24 +1569,44 @@ class Engine:
                        f"exit fills {exit_qty} != entry fills {ex['filled_qty']}", ex["account_id"],
                        ex["trade_id"])
         now = self.clock.now()
+        final: dict[str, Any] = {}
+        if ex["exit_plan"]:  # durable per-leg executed/remaining, final at close
+            final["exit_plan"] = dict(ex["exit_plan"], legs=self._leg_progress(ex, ex["exit_plan"]))
+        since = parse_ts(ex["unprotected_since"])
+        if since is not None:  # exposure ended (flat) while not stop-protected: record interval
+            dur = Decimal(str(round((now - since).total_seconds(), 3)))
+            final["max_unprotected_seconds"] = max(ex["max_unprotected_seconds"] or ZERO, dur)
+            self.j.log_execution(ex["id"], now, "UNPROTECTED_INTERVAL", seconds=s(dur), ended_by="FLAT")
+        self.j.update_execution(ex["id"], now, **final)
         self.j.update_execution(ex["id"], now, state=str(ExecState.CLOSED), closed_at=now,
                                 close_reason=reason or "FLAT", exit_fees=exit_fees, realized_pnl=gross,
                                 entry_fees=entry_fees, net_pnl=gross - exit_fees - entry_fees,
-                                protected_qty=ZERO,
-                                reserved_amount=ZERO)
+                                protected_qty=ZERO, reserved_amount=ZERO, stop_coverage="NONE",
+                                tp_coverage="NONE", unprotected_since=None)
         self.j.log_execution(ex["id"], now, "CLOSED", reason=reason, realized=s(gross))
         self._resolve_exec_incidents(ex, "exposure flat confirmed by venue")
         self.alert("INFO", "TRADE_CLOSED", f"{ex['trade_id']} closed ({reason}); gross {gross:.4f}",
                    ex["account_id"], ex["trade_id"])
 
     # ------------------------------------------------------------ management loop
+    MAX_ACCOUNT_ERRORS_PER_CYCLE = 3
+
     def manage_all(self) -> None:
+        """One bounded pass per execution per cycle. An account that keeps failing is capped at
+        MAX_ACCOUNT_ERRORS_PER_CYCLE adapter errors per cycle, so it cannot starve the others."""
         for ex in self.j.active_executions(TERMINAL):
+            aid = ex["account_id"]
+            if self._acct_errors.get(aid, 0) >= self.MAX_ACCOUNT_ERRORS_PER_CYCLE:
+                continue
             try:
                 self.manage(ex)
             except AdapterError as e:
+                self._acct_errors[aid] = self._acct_errors.get(aid, 0) + 1
                 self.alert("ERROR", "ADAPTER_ERROR", f"execution {ex['id']}: {e}", ex["account_id"],
                            ex["trade_id"])
+            except sqlite3.Error as e:  # this execution's local write failed; others continue
+                log.error("journal write failed for execution %s: %s", ex["id"], e)
+                self.metrics["cycle_errors"] += 1
             except Exception as e:  # isolate: other accounts keep being managed
                 log.exception("managing execution %s failed", ex["id"])
                 self.incident(R.INTERNAL_ERROR, ex["account_id"], ex["id"], f"{e!r}")

@@ -50,6 +50,22 @@ Trade-level status: `ACTIVE`, `CLOSE_REQUESTED`, `CANCEL_REQUESTED`, `TOMBSTONED
 Order status: `INTENT` (persisted before submission) → `OPEN | FILLED | CANCELLED | EXPIRED |
 REJECTED`, or `UNKNOWN` → reconciled → `NOT_ACCEPTED`.
 
+## Phase 2A additions
+* **Coverage fields** per execution: `stop_coverage` (`NONE|UNVERIFIED|VERIFIED`) and
+  `tp_coverage` (`NONE|DEGRADED|COMPLETE`), `unprotected_since`, `max_unprotected_seconds`
+  (measured from the first fill / loss of coverage until a venue stop is verified OPEN, or until
+  flat), `tp_fail_count`, `tp_retry_at`, `stop_fix_retry_at`. Exit-plan legs persist
+  `executed_qty` / `remaining_qty` derived from journaled fills of the current plan version.
+* **New-entry gate** `ACCOUNT_DEGRADED` (dynamic, clears itself) while any exposure on the
+  account has degraded TPs or an unverified stop.
+* **Ingestion order:** auth (envelope) → contract → journal → archive. Inbox moves that fail are
+  alerts, not stage failures; undecodable files are quarantined individually.
+* **Cycle stages** (ingest, events, manage, quote probe, periodic reconcile) are isolated; a
+  journal failure stops only the stage/execution that hit it. An interrupted OPEN resumes routing
+  to its original accounts that have no execution yet (full preflight again).
+* **Journal** schema v2 (additive migration on first read-write open); simulator DB in rollback
+  journal mode; worker heartbeat file (`kind`, pid, metrics); operator control queue `control\`.
+
 ## Key policies
 
 **Sizing.** `target_notional = M × L`; contracts = `floor_to_step(M × L / P / multiplier)`.

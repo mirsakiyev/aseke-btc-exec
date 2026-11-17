@@ -1,0 +1,8 @@
+{
+  "note": "TEST-ONLY deterministic fixture. This key is public and must never be used for anything but tests.",
+  "key_is_test_only": true,
+  "key_id": "fixture-k1",
+  "test_only_key_hex": "544553542d4f4e4c592d484d41432d464958545552452d4b45592d2d6e6f742d612d7365637265742d2d30303031",
+  "signing_bytes_sha256": "0619bff47a8aca0c74190868e16ada1f3d5175f75a2a25f1101efab0b2ea195f",
+  "signature": "3b91385bdd0f3e72ade40aae526295d53c0fb0b241235456f3264d3909e4a987"
+}
