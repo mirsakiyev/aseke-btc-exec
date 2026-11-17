@@ -15,3 +15,6 @@ secrets/
 *.key
 # Isolated runtime roots for demos, soaks, restores.
 runtime/
+# Phase 2B project-private runtime: downloaded interpreter, wheelhouse, pip cache, approved venv.
+.exec-runtime/
+.venv-exec/

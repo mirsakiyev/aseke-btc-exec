@@ -19,6 +19,7 @@ from aseke_exec.clock import SystemClock, parse_utc
 from aseke_exec.examples import build_amend, build_close, build_open
 from aseke_exec.faults import ENV, EXIT_CODE
 from aseke_exec.inbox import publish_event
+from aseke_exec.journal import connect_readonly
 from aseke_exec.sim import SimExchange
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +54,9 @@ class RT:
         return publish_event(self.root / "inbox", ev)
 
     def q(self, sql, args=()):
-        c = sqlite3.connect((self.root / "journal.db").resolve().as_uri() + "?mode=ro", uri=True)
+        # product read-only opener: bounded retry of the transient SQLITE_IOERR_TRUNCATE that
+        # SQLite 3.53.x can return on the first read after a WAL writer was killed (Phase 2B)
+        c = connect_readonly(self.root / "journal.db")
         c.row_factory = sqlite3.Row
         try:
             return [dict(r) for r in c.execute(sql, args)]

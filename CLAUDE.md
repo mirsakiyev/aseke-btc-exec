@@ -21,4 +21,10 @@ Key paths: `src/aseke_exec/engine.py` (lifecycle), `planning.py` (pure math),
 `ops.py` (health/backup/restore/runtime-info), `soak.py`, `faults.py` (crash points), `docs/`
 (runbook.md, signal-envelope.md, phase2a-acceptance-report.md).
 
-Commands: `.venv\Scripts\python -m pytest` · `.\scripts\aseke-exec.ps1 scenario run all`
+`runtime_policy.py` (approved-runtime gate; pin in `config/runtime-lock.json`),
+`scripts/setup.ps1` (provisioning), `scripts/storage_compat.py` (cross-runtime storage evidence),
+`docs/phase2b-acceptance-report.md` (current verdict).
+
+Commands: `.venv-exec\Scripts\python -m pytest --basetemp $env:TEMP\aseke-pt` ·
+`.\scripts\aseke-exec.ps1 scenario run all` · `.\scripts\aseke-exec.ps1 runtime-info`.
+Never run operational commands on the old `.venv` (affected SQLite; refused by the gate).

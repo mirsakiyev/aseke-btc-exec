@@ -1,0 +1,43 @@
+{
+  "format": "aseke.exec.runtime-lock/1",
+  "approved_build_id": "python.org-cpython-3.15.2-amd64+sqlite-3.53.4",
+  "selected_on": "2026-11-16",
+  "provider": "Python Software Foundation (python.org official Windows full-layout package)",
+  "python": {
+    "implementation": "cpython",
+    "version": "3.15.2",
+    "build": "tags/v3.15.2:5e58eaa",
+    "architecture": "AMD64",
+    "free_threaded": false
+  },
+  "sqlite": {
+    "version": "3.53.4",
+    "source_id": "2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc"
+  },
+  "artifact": {
+    "name": "python-3.15.2-amd64.zip",
+    "url": "https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.zip",
+    "sha256": "d6da9c33a32cf111e1d52b91392c83ea6a808545b646e0557f66cb6d9ee76785",
+    "size": 37272560,
+    "checksum_source": "https://www.python.org/ftp/python/index-windows.json (entry pythoncore-3.15-64, sort-version 3.15.2)",
+    "index_url": "https://www.python.org/ftp/python/index-windows.json",
+    "index_id": "pythoncore-3.15-64",
+    "sbom_url": "https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.zip.spdx.json",
+    "sbom_sqlite_version": "3.53.4.0",
+    "authenticode_signer_subject": "CN=Python Software Foundation, O=Python Software Foundation, L=Beaverton, S=Oregon, C=US",
+    "authenticode_thumbprint_observed": "6C435B1CAA2CA423A76C14A6693CD55644C8B4D6",
+    "unsigned_allowed_prefix": "Lib\\site-packages\\pip\\_vendor\\distlib\\"
+  },
+  "paths": {
+    "interpreter_dir": ".exec-runtime/cpython-3.15.2-amd64",
+    "venv_dir": ".venv-exec",
+    "downloads_dir": ".exec-runtime/downloads/python.org-3.15.2",
+    "wheel_dir": ".exec-runtime/wheels/cp315-win_amd64",
+    "pip_cache_dir": ".exec-runtime/pip-cache"
+  },
+  "dependencies_lock": "requirements/dev-cp315-win_amd64.lock",
+  "evidence": {
+    "known_wal_reset_fix": "SQLite 3.53.4 >= 3.51.3 (https://sqlite.org/wal.html, https://sqlite.org/news.html)",
+    "extended_soak": "PENDING"
+  }
+}

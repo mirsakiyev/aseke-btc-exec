@@ -1,4 +1,4 @@
-# ASEKE BTC Exec — Phase 2A (simulation only)
+# ASEKE BTC Exec — Phase 2B (simulation only)
 
 ASEKE BTC **Lab** decides which trading opportunities to authorize. ASEKE BTC **Exec**
 (this repository) receives those authorizations, validates them, sizes positions from its
@@ -26,25 +26,33 @@ and reconciles state.
   `backup`/`restore` into new roots, bounded `soak`. See [docs/runbook.md](docs/runbook.md).
 
 Architecture: [docs/architecture.md](docs/architecture.md). Acceptance evidence:
-[Phase 1](docs/acceptance-report.md), [Phase 2A](docs/phase2a-acceptance-report.md).
+[Phase 1](docs/acceptance-report.md), [Phase 2A](docs/phase2a-acceptance-report.md),
+[Phase 2B — patched runtime](docs/phase2b-acceptance-report.md).
 Future real adapters: [docs/future-adapter-checklist.md](docs/future-adapter-checklist.md).
 Rules for contributors/agents: [AGENTS.md](AGENTS.md).
 
-> **Runtime note:** the embedded SQLite here (3.49.1) is affected by the upstream
-> WAL-reset bug. A single-writer topology mitigates it, but unattended operation is not
-> certified until a project-isolated runtime with SQLite ≥ 3.51.3 (or 3.50.7 / 3.44.6) is used.
-> Check with `.\scripts\aseke-exec.ps1 runtime-info`. Details: [runbook](docs/runbook.md).
+> **Runtime note:** the executor runs only on the **approved project-private runtime** pinned in
+> [config/runtime-lock.json](config/runtime-lock.json): python.org CPython 3.15.2 (amd64) whose
+> loaded SQLite is 3.53.4 (contains the upstream WAL-reset fix). Operational commands refuse any
+> other interpreter (exit 4), including the old `.venv` (Python 3.12.10 / SQLite 3.49.1, affected),
+> which is kept only for diagnosis. The single-writer topology stays in place. Extended-soak
+> evidence is still **pending**. Check with `.\scripts\aseke-exec.ps1 runtime-info`.
 
 ## Windows setup (PowerShell, repository root)
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
-# or manually:
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1          # provision / verify (idempotent)
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Check   # verify only, changes nothing
 ```
-Every command goes through `.\scripts\aseke-exec.ps1` (= `.\.venv\Scripts\python.exe -m
-aseke_exec`). Use `--data-dir runtime\<name>` to give every demo/test/soak its **own runtime
-root** (git-ignored). Without `--data-dir` the config's `data_dir` (`var\`) is used.
+`setup.ps1` downloads the pinned python.org zip into `.exec-runtime\` (git-ignored), verifies the
+pinned SHA-256, the python.org index digest (when online) and the PSF Authenticode signature of
+every binary, probes the staged interpreter's loaded SQLite, creates `.venv-exec` at its final
+path from hash-locked wheels, and writes its verification marker last. It never touches the old
+`.venv`, `var\`, runtime roots, global Python, PATH, the registry or the `py` launcher.
+
+Every command goes through `.\scripts\aseke-exec.ps1` (= `.\.venv-exec\Scripts\python.exe -I -m
+aseke_exec`; no fallback to any other Python). Use `--data-dir runtime\<name>` to give every
+demo/test/soak its **own runtime root** (git-ignored). Without `--data-dir` the config's
+`data_dir` (`var\`) is used.
 
 ## Demonstration (unsigned compatibility profile, isolated root)
 ```powershell
@@ -94,7 +102,7 @@ $env:ASEKE_EXEC_HMAC_SIM_DEMO_K1 = (Get-Content -Raw secrets\sim-demo-k1.key).Tr
 | Backup / restore | `backup --dest <new dir>` · `--data-dir <new root> restore --backup <dir>` |
 | Soak | `--data-dir <new root> soak --duration-seconds N` or `--cycles N --accelerated` |
 | Scenarios / simulator harness | `scenario list|run all` · `sim init|show|set-market|fault` |
-| Tests | `.\.venv\Scripts\python.exe -m pytest` |
+| Tests / lint | `.\.venv-exec\Scripts\python.exe -m pytest --basetemp $env:TEMP\aseke-pt` · `.\.venv-exec\Scripts\python.exe -m pyflakes src tests scripts` |
 
 Pause and account-disable stop **new entries only**. Only one worker can run per runtime root
 (OS lock). Nothing installs a Windows service or scheduled task. Never delete a runtime root
@@ -103,5 +111,6 @@ or SQLite sidecar files as routine recovery; initialise a new root instead.
 ## Limitations (summary)
 Synthetic venues only; no liquidation/funding model; separate (non-bracket) protective orders;
 source-risk metadata informational only; amendments ABSOLUTE only; HMAC is shared-key
-authentication only; affected embedded SQLite (see above). Full list:
-[docs/phase2a-acceptance-report.md](docs/phase2a-acceptance-report.md#limitations).
+authentication only; extended (24 h) soak not yet run. Full lists:
+[Phase 2A](docs/phase2a-acceptance-report.md#limitations),
+[Phase 2B](docs/phase2b-acceptance-report.md#remaining-limitations).

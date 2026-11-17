@@ -321,12 +321,19 @@ def cmd_soak(args: argparse.Namespace) -> int:
     try:
         rep = run_soak(args.config, args.data_dir, duration_seconds=args.duration_seconds,
                        cycles=args.cycles, accelerated=args.accelerated, poll_seconds=args.poll_seconds,
-                       seed=args.seed)
+                       seed=args.seed, progress_every_seconds=args.progress_every_seconds)
     except (FileExistsError, ValueError) as e:
         print(f"refused: {e}")
         return 2
     _print(rep)
-    return 1 if rep["invariant_violations"] else 0
+    st = rep.get("storage", {})
+    storage_ok = all(v.get("integrity_check") == "ok" and v.get("foreign_key_violations") == 0
+                     for v in st.values())
+    if not rep["completed"]:
+        print(f"SOAK {rep['status']}: partial evidence only (elapsed {rep['elapsed_wall_seconds']} s); "
+              "an interrupted run is NOT a completed soak")
+        return 5
+    return 0 if (not rep["invariant_violations_total"] and storage_ok) else 1
 
 
 def cmd_scenario(args: argparse.Namespace) -> int:
@@ -494,6 +501,8 @@ def build_parser() -> argparse.ArgumentParser:
     so.add_argument("--accelerated", action="store_true", help="injected clock (NOT a real-time soak)")
     so.add_argument("--poll-seconds", type=float, default=0.5)
     so.add_argument("--seed", type=int, default=7)
+    so.add_argument("--progress-every-seconds", type=float, default=60.0,
+                    help="wall-clock interval for soak-progress.json / soak-checkpoints.jsonl")
     so.set_defaults(fn=cmd_soak)
     sc = sub.add_parser("scenario", help="run deterministic acceptance scenarios (temp dirs)")
     sc.add_argument("action", choices=["list", "run"])
@@ -514,10 +523,46 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+#: Commands that stay usable on an unapproved runtime: help, configuration and database-
+#: independent diagnostics, plus the READ-ONLY status/health inspectors (mode=ro connections never
+#: write pages or checkpoint). Everything else - anything that can create runtime files, open an
+#: execution database for writing, or process signals/controls - is refused (exit 4) BEFORE it runs.
+_DIAGNOSTIC = {("validate-config", None), ("runtime-info", None), ("status", None), ("health", None),
+               ("auth", "gen-key"), ("auth", "check"), ("scenario", "list")}
+
+
+def _runtime_gate(args: argparse.Namespace) -> int | None:
+    from .runtime_policy import current
+    key = (args.cmd, getattr(args, "action", None) if args.cmd in ("auth", "scenario") else None)
+    st = current()
+    if key in _DIAGNOSTIC:
+        if not st.operational:
+            print(f"WARNING: runtime not approved for operation ({st.wal_reset_fix}; "
+                  f"{sys.executable}) - diagnostics only", file=sys.stderr)
+        return None
+    if st.operational:
+        return None
+    print(f"refused: `{args.cmd}` needs the approved project runtime (config/runtime-lock.json).")
+    print(f"  interpreter: {sys.executable}")
+    print(f"  loaded SQLite: {st.probe.get('sqlite_version')} ({st.probe.get('sqlite_source_id')})")
+    print(f"  WAL-reset fix: {st.wal_reset_fix}; approved build: {st.approved_build}")
+    for r in st.reasons:
+        print(f"  - {r}")
+    print(r"  Use .\scripts\aseke-exec.ps1 (after .\scripts\setup.ps1); diagnostics: runtime-info")
+    return 4
+
+
 def main(argv: list[str] | None = None) -> int:
+    from .runtime_policy import RuntimeNotApproved
     args = build_parser().parse_args(argv)
+    gate = _runtime_gate(args)
+    if gate is not None:
+        return gate
     try:
         return int(args.fn(args) or 0)
+    except RuntimeNotApproved as e:
+        print(f"refused: {e}")
+        return 4
     except ConfigError as e:
         print("CONFIGURATION INVALID:")
         for pr in e.problems:

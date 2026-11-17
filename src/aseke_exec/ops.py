@@ -27,8 +27,10 @@ from typing import Any
 from .clock import SystemClock, iso, parse_utc
 from .config import Config
 from .engine import TERMINAL
-from .journal import SCHEMA_VERSION, Journal
+from .journal import SCHEMA_VERSION, Journal, connect_readonly
 from .lock import ProcessLock
+from .runtime_policy import classify_wal_reset, release_exclusion
+from .runtime_policy import current as runtime_policy_status
 
 PKG_DIR = Path(__file__).resolve().parent
 RUNTIME_DIRS = ("inbox", "archive", "quarantine", "control")
@@ -36,18 +38,12 @@ RUNTIME_DIRS = ("inbox", "archive", "quarantine", "control")
 
 # ------------------------------------------------------------------ runtime fingerprint
 def wal_reset_status(version: str) -> dict[str, Any]:
-    """Classify the embedded SQLite against https://sqlite.org/wal.html section 'WAL-reset bug'
-    (affected 3.7.0 .. 3.51.2; fixed 3.51.3+; backports 3.44.6 and 3.50.7)."""
-    v = tuple(int(x) for x in version.split(".")[:3])
-    if v >= (3, 51, 3):
-        st = "FIXED"
-    elif (3, 50, 7) <= v < (3, 51, 0) or (3, 44, 6) <= v < (3, 45, 0):
-        st = "FIXED_BACKPORT"
-    elif (3, 7, 0) <= v <= (3, 51, 2):
-        st = "AFFECTED"
-    else:
-        st = "NOT_APPLICABLE"
-    return {"sqlite_version": version, "wal_reset_bug": st,
+    """Classify a SQLite version against https://sqlite.org/wal.html section 'WAL-reset bug'
+    (affected 3.7.0 .. 3.51.2; fixed 3.51.3+; backports 3.44.6 and 3.50.7). Delegates to
+    runtime_policy (numeric parse; unparseable -> UNKNOWN). Release-policy exclusions and build
+    approval are reported separately by runtime_policy."""
+    return {"sqlite_version": version, "wal_reset_bug": classify_wal_reset(version),
+            "release_exclusion": release_exclusion(version),
             "reference": "https://sqlite.org/wal.html (WAL-reset bug section)"}
 
 
@@ -89,10 +85,15 @@ def runtime_info(cfg: Config | None = None) -> dict[str, Any]:
         except md.PackageNotFoundError:
             deps[name] = None
     repo = PKG_DIR.parents[1]
+    pol = runtime_policy_status()
     info: dict[str, Any] = {
         "python_executable": sys.executable, "python_version": sys.version,
         "platform": platform.platform(), "sqlite_source_id": source_id,
         **wal_reset_status(sqlite3.sqlite_version), "dependencies": deps,
+        "interpreter": {k: pol.probe.get(k) for k in ("prefix", "base_prefix", "base_executable",
+                                                       "implementation", "pointer_bits", "free_threaded",
+                                                       "sqlite3_module", "_sqlite3_module")},
+        "runtime_policy": pol.as_dict(),
         "source_fingerprint_sha256": source_fingerprint(), "git_head": git_revision(repo),
     }
     if cfg is not None:
@@ -204,11 +205,15 @@ def health_report(cfg: Config) -> dict[str, Any]:
                     "last_stage_errors": metrics.get("last_stage_errors"),
                     "held_inbox_files": metrics.get("held_files")},
         "quote_age_seconds": metrics.get("quote_age_seconds", {}),
-        "runtime": wal_reset_status(sqlite3.sqlite_version),
+        "runtime": {**wal_reset_status(sqlite3.sqlite_version), "runtime_policy": runtime_policy_status().as_dict()},
     }
+    pol = runtime_policy_status()
     if out["runtime"]["wal_reset_bug"] == "AFFECTED":
         reasons.append(f"embedded SQLite {sqlite3.sqlite_version} is affected by the WAL-reset bug "
                        "(single-writer mitigation active; unattended operation not certified)")
+    if not pol.operational:
+        reasons.append("this inspecting interpreter is not the approved project runtime: "
+                       + "; ".join(pol.reasons))
     for aid, age in (metrics.get("quote_age_seconds") or {}).items():
         if age is None or age > cfg.execution.max_quote_age_seconds:
             reasons.append(f"{aid}: quote unavailable/stale ({age})")
@@ -340,18 +345,31 @@ def _sha256(p: Path) -> str:
 def _sqlite_copy(src: Path, dst: Path) -> None:
     """SQLite Online Backup API: consistent snapshot including committed WAL content.
     The source is opened read-only; no sidecar file is touched manually."""
-    s = sqlite3.connect(src.resolve().as_uri() + "?mode=ro", uri=True)
-    d = sqlite3.connect(str(dst))
+    s = connect_readonly(src)
     try:
-        s.backup(d)
-        d.execute("PRAGMA journal_mode=DELETE")  # self-contained artifact (no -wal needed)
+        d = sqlite3.connect(str(dst))
+        try:
+            s.backup(d)
+            d.execute("PRAGMA journal_mode=DELETE")  # self-contained artifact (no -wal needed)
+        finally:
+            d.close()
     finally:
-        d.close()
         s.close()
 
 
+def _recorded_schema(db: Path) -> int:
+    """Schema version the (copied) journal itself records - not this code's SCHEMA_VERSION, so a
+    backup of an old schema-v1 root is labelled v1 (it is migrated only when a restore is opened)."""
+    c = connect_readonly(db)
+    try:
+        r = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        return int(r[0]) if r else 0
+    finally:
+        c.close()
+
+
 def _counts(db: Path, tables: tuple[str, ...]) -> dict[str, int]:
-    c = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+    c = connect_readonly(db)
     try:
         return {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
     finally:
@@ -381,7 +399,7 @@ def backup_runtime(cfg: Config, dest: Path) -> dict[str, Any]:
         manifest = {
             "format": "aseke.exec.backup/1", "generation": uuid.uuid4().hex,
             "created_at": iso(SystemClock().now()), "source_data_dir": str(cfg.data_dir),
-            "quiesced": True, "config_hash": cfg.source_hash, "journal_schema_version": SCHEMA_VERSION,
+            "quiesced": True, "config_hash": cfg.source_hash, "journal_schema_version": _recorded_schema(dest / "journal.db"),
             "sqlite_version": sqlite3.sqlite_version,
             "files": {n: {"sha256": _sha256(dest / n), "bytes": (dest / n).stat().st_size} for n in files},
             "row_counts": {"journal.db": _counts(dest / "journal.db", ("events", "executions", "orders", "fills")),

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
@@ -20,6 +21,36 @@ from .clock import iso, parse_utc
 from .num import D, s
 
 SCHEMA_VERSION = 2
+
+#: Extended result codes on which a fresh read-only connection is retried (bounded).
+#: Observed with SQLite 3.53.4 on Windows: after a WAL writer exits uncleanly (killed), the FIRST
+#: read through a NEW ``mode=ro`` connection can fail with SQLITE_IOERR_TRUNCATE while the
+#: shared-memory index is re-initialised; an immediate reopen succeeds (Phase 2B report).
+_RO_RETRYABLE = frozenset({"SQLITE_IOERR_TRUNCATE"})
+
+
+def connect_readonly(path: str | Path, *, timeout_s: float = 15.0, attempts: int = 4) -> sqlite3.Connection:
+    """Open ``path`` with ``mode=ro`` and prove it readable (one read transaction).
+
+    Retries ONLY the specific transient code above, at most ``attempts`` times; any other error
+    is raised immediately. A read-only connection never writes database pages or checkpoints.
+    """
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    last: sqlite3.OperationalError | None = None
+    for i in range(max(1, attempts)):
+        c = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=timeout_s)
+        try:
+            c.execute(f"PRAGMA busy_timeout={int(timeout_s * 1000)}")
+            c.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return c
+        except sqlite3.OperationalError as e:
+            c.close()
+            if getattr(e, "sqlite_errorname", None) not in _RO_RETRYABLE:
+                raise
+            last = e
+            time.sleep(0.05 * (i + 1))
+    assert last is not None
+    raise last
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -192,11 +223,12 @@ class Journal:
         if readonly:
             if not self.path.exists():
                 raise FileNotFoundError(f"journal not found: {self.path}")
-            self.conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True,
-                                        isolation_level=None, timeout=busy_timeout_ms / 1000)
+            self.conn = connect_readonly(self.path, timeout_s=busy_timeout_ms / 1000)
             self.conn.row_factory = sqlite3.Row
-            self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             return
+        # Writable journal: only on the approved runtime (runtime_policy; no bypass).
+        from .runtime_policy import require_operational
+        require_operational("opening the execution journal for writing")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path), isolation_level=None,
                                     timeout=busy_timeout_ms / 1000)

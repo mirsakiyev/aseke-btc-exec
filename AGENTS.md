@@ -57,8 +57,15 @@ this repository. CLAUDE.md points here. Keep both in sync.
   prefer `init-runtime` on a new root. `sim init --reset` is refused when the journal has history.
 - **Single journal writer:** only the worker process writes the journal; operator commands queue
   control requests while a worker runs; status/health read with `mode=ro`. Keep it that way
-  (embedded SQLite 3.49.1 is affected by the WAL-reset bug; do not replace global DLLs or the
-  global Python - remediation is a project-isolated runtime, by operator decision).
+  even on the patched runtime (defence in depth; never replace global DLLs or the global Python).
+- **Approved runtime (Phase 2B):** only the project-private interpreter pinned in
+  `config/runtime-lock.json` (`.venv-exec`, python.org CPython 3.15.2 amd64, loaded SQLite 3.53.4)
+  may run operational commands; `runtime_policy.py` refuses others (exit 4) before touching a
+  runtime root. Run everything via `scripts\aseke-exec.ps1` or `.venv-exec\Scripts\python.exe`.
+  Never add an environment-variable bypass, never point tooling at the old `.venv` (kept only for
+  diagnosis), never mark `evidence.extended_soak` complete without a reviewed operator soak.
+  Changing the pinned build means updating the lock file, the dependency lock and re-running
+  `scripts\storage_compat.py` plus the full regression (docs/phase2b-acceptance-report.md).
 - **Authentication:** `[auth] mode` must be explicit (`strict` or `simulation-compat-unsigned`).
   Strict mode never falls back to unsigned. Keys only via env var / excluded secret file; never in
   config, journal, logs, reports, examples (except the public TEST-ONLY fixture key) or CLI args.
@@ -70,11 +77,15 @@ this repository. CLAUDE.md points here. Keep both in sync.
 - **Crash points:** `ASEKE_EXEC_CRASHPOINT` (src/aseke_exec/faults.py) is a test hook; tests may
   kill only subprocesses they started. Never terminate user workers or touch aseke-btc-lab.
 - Raw test counts are not a readiness gate; the readiness verdict lives in
-  docs/phase2a-acceptance-report.md.
+  docs/phase2b-acceptance-report.md (Phase 2A evidence: docs/phase2a-acceptance-report.md).
 
 ## Engineering conventions
-- Python 3.12+, stdlib-only runtime; dev deps: pytest, jsonschema (pyflakes used locally for lint).
-- Run tests: `.venv\Scripts\python -m pytest` (deterministic, no network, no sleeps).
+- Code stays compatible with Python 3.12+ (`requires-python`); the approved execution runtime is
+  CPython 3.15.2. Stdlib-only runtime; dev deps (hash-locked in `requirements/`): pytest,
+  jsonschema, pyflakes.
+- Run tests: `.venv-exec\Scripts\python -m pytest --basetemp $env:TEMP\aseke-pt` (deterministic,
+  offline). Keep `--basetemp` short: the setup test copies the repo under it and Windows
+  PowerShell 5.1 has a ~248-character directory limit.
 - Business invariants are asserted in `src/aseke_exec/scenarios.py` (shared by tests and
   `aseke-exec scenario run`). Add a scenario for every new lifecycle behaviour.
 - Contract changes require a new `schema_version`, updated `schemas/`, `examples/`, and

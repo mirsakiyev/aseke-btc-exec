@@ -97,6 +97,10 @@ def _levels_js(levels: list[list[Decimal]] | list[tuple[Decimal, Decimal]]) -> s
 
 class SimExchange:
     def __init__(self, path: str | Path, clock: Clock):
+        # Writable simulator store: only on the approved runtime, also for library use
+        # (runtime_policy; no bypass). Checked before any directory or file is created.
+        from .runtime_policy import require_operational
+        require_operational("opening the simulator database for writing")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock

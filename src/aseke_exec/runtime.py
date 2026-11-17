@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import PHASE
 from .clock import Clock, SystemClock, iso
 from .config import Config
 from .engine import TERMINAL, Engine
@@ -187,7 +188,7 @@ def status_report(journal: Journal, limit: int = 20) -> dict[str, Any]:
             "deadline_at", "close_reason", "realized_pnl", "net_pnl")}
 
     return {
-        "phase": "2A-simulation-only",
+        "phase": PHASE,
         "controls": {r["key"]: r["value"] for r in journal.q("SELECT * FROM controls")},
         "accounts": journal.q("SELECT * FROM accounts ORDER BY account_id"),
         "active_executions": [ex_view(e) for e in journal.active_executions(TERMINAL)],
@@ -233,6 +234,8 @@ def run_worker(cfg: Config, max_cycles: int | None = None, config_path: Path | N
                poll_seconds: float | None = None) -> int:
     """Foreground worker: single process (lock), startup reconcile, then periodic cycles."""
     from .config import ConfigError, load_config
+    from .runtime_policy import require_operational
+    require_operational("worker startup")  # before the lock, controls, signals or databases
     poll = cfg.poll_interval_seconds if poll_seconds is None else poll_seconds
     with ProcessLock(cfg.lock_path):
         rt = build_runtime(cfg)

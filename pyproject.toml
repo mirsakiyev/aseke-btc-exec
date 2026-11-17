@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aseke-btc-exec"
-version = "0.2.0"
-description = "ASEKE BTC Exec - Phase 1 simulation-only execution worker (no live trading)"
+version = "0.3.0"
+description = "ASEKE BTC Exec - simulation-only execution worker (no live trading)"
 readme = "README.md"
 requires-python = ">=3.12"
 # Runtime uses only the Python standard library (sqlite3, decimal, tomllib, argparse).

@@ -141,6 +141,29 @@ def test_coordinated_backup_and_restore_to_new_root(cfgfile, tmp_path, capsys):
     assert (new / "restored-from.json").exists()
 
 
+def test_backup_manifest_records_the_source_schema_not_the_code_schema(cfgfile, tmp_path, capsys):
+    import sqlite3
+    root, bk, new = tmp_path / "rt", tmp_path / "bk", tmp_path / "new"
+    run(cfgfile, root, "init-runtime")
+    run(cfgfile, root, "publish-example", "long", "--trade-id", "ops-v1")
+    run(cfgfile, root, "cycle")
+    c = sqlite3.connect(root / "journal.db")  # label the journal as an older schema (v1)
+    c.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+    c.commit()
+    c.close()
+    assert run(cfgfile, root, "backup", "--dest", str(bk)) == 0
+    assert json.loads((bk / "manifest.json").read_text())["journal_schema_version"] == 1
+    assert run(cfgfile, new, "restore", "--backup", str(bk)) == 0
+    assert run(cfgfile, new, "cycle") == 0
+    ro = sqlite3.connect((new / "journal.db").resolve().as_uri() + "?mode=ro", uri=True)
+    assert ro.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "2"
+    ro.close()
+    src = sqlite3.connect((root / "journal.db").resolve().as_uri() + "?mode=ro", uri=True)
+    assert src.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "1", \
+        "backup never migrates the source root"
+    src.close()
+
+
 def test_accelerated_soak_runs_with_no_invariant_violations(cfgfile, tmp_path):
     logging.disable(logging.WARNING)
     rep = run_soak(cfgfile, tmp_path / "soak", cycles=400, accelerated=True, poll_seconds=1.0)
