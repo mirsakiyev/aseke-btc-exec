@@ -24,6 +24,7 @@ from .runtime import (
     write_status,
 )
 from .sim import FAULT_MODES, FAULT_OPS, SimExchange
+from .soak import FUNDING_PROFILES as FUNDING_PROFILE_NAMES
 
 DEFAULT_CONFIG = "config/sim.toml"
 
@@ -321,7 +322,8 @@ def cmd_soak(args: argparse.Namespace) -> int:
     try:
         rep = run_soak(args.config, args.data_dir, duration_seconds=args.duration_seconds,
                        cycles=args.cycles, accelerated=args.accelerated, poll_seconds=args.poll_seconds,
-                       seed=args.seed, progress_every_seconds=args.progress_every_seconds)
+                       seed=args.seed, progress_every_seconds=args.progress_every_seconds,
+                       funding_profile=args.funding_profile)
     except (FileExistsError, ValueError) as e:
         print(f"refused: {e}")
         return 2
@@ -333,7 +335,12 @@ def cmd_soak(args: argparse.Namespace) -> int:
         print(f"SOAK {rep['status']}: partial evidence only (elapsed {rep['elapsed_wall_seconds']} s); "
               "an interrupted run is NOT a completed soak")
         return 5
-    return 0 if (not rep["invariant_violations_total"] and storage_ok) else 1
+    acc = rep.get("workload_acceptance", {})
+    if not acc.get("ok", False):
+        print("SOAK WORKLOAD REVIEW REQUIRED: " + json.dumps(
+            {k: acc.get(k) for k in ("generator_errors", "ingest_not_journaled",
+                                     "unexpected_rejections", "reconciles")}, default=str))
+    return 0 if (not rep["invariant_violations_total"] and storage_ok and acc.get("ok", False)) else 1
 
 
 def cmd_scenario(args: argparse.Namespace) -> int:
@@ -503,6 +510,9 @@ def build_parser() -> argparse.ArgumentParser:
     so.add_argument("--seed", type=int, default=7)
     so.add_argument("--progress-every-seconds", type=float, default=60.0,
                     help="wall-clock interval for soak-progress.json / soak-checkpoints.jsonl")
+    so.add_argument("--funding-profile", default="config", choices=sorted(FUNDING_PROFILE_NAMES),
+                    help="TEST-ONLY synthetic starting wallets for the NEW soak simulator "
+                         "(config = as configured; only wallets change, never risk policy)")
     so.set_defaults(fn=cmd_soak)
     sc = sub.add_parser("scenario", help="run deterministic acceptance scenarios (temp dirs)")
     sc.add_argument("action", choices=["list", "run"])

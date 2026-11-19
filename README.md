@@ -1,4 +1,4 @@
-# ASEKE BTC Exec — Phase 2B (simulation only)
+# ASEKE BTC Exec — Phase 2C (simulation only)
 
 ASEKE BTC **Lab** decides which trading opportunities to authorize. ASEKE BTC **Exec**
 (this repository) receives those authorizations, validates them, sizes positions from its
@@ -27,7 +27,8 @@ and reconciles state.
 
 Architecture: [docs/architecture.md](docs/architecture.md). Acceptance evidence:
 [Phase 1](docs/acceptance-report.md), [Phase 2A](docs/phase2a-acceptance-report.md),
-[Phase 2B — patched runtime](docs/phase2b-acceptance-report.md).
+[Phase 2B — patched runtime](docs/phase2b-acceptance-report.md),
+[Phase 2C — soak workload corrections and closeout](docs/phase2c-acceptance-report.md) (current verdict).
 Future real adapters: [docs/future-adapter-checklist.md](docs/future-adapter-checklist.md).
 Rules for contributors/agents: [AGENTS.md](AGENTS.md).
 
@@ -35,8 +36,10 @@ Rules for contributors/agents: [AGENTS.md](AGENTS.md).
 > [config/runtime-lock.json](config/runtime-lock.json): python.org CPython 3.15.2 (amd64) whose
 > loaded SQLite is 3.53.4 (contains the upstream WAL-reset fix). Operational commands refuse any
 > other interpreter (exit 4), including the old `.venv` (Python 3.12.10 / SQLite 3.49.1, affected),
-> which is kept only for diagnosis. The single-writer topology stays in place. Extended-soak
-> evidence is still **pending**. Check with `.\scripts\aseke-exec.ps1 runtime-info`.
+> which is kept only for diagnosis. The single-writer topology stays in place. One clean
+> strict-signed 24 h simulation soak has completed (Phase 2C reviews its workload limitations);
+> `evidence.extended_soak` stays **pending** operator sign-off, and unattended or live operation
+> is not approved. Check with `.\scripts\aseke-exec.ps1 runtime-info`.
 
 ## Windows setup (PowerShell, repository root)
 ```powershell
@@ -100,7 +103,7 @@ $env:ASEKE_EXEC_HMAC_SIM_DEMO_K1 = (Get-Content -Raw secrets\sim-demo-k1.key).Tr
 | Publish signals | `publish-example long|short|multi-tp|timed [--signed]`, `close|cancel|amend --trade-id X` |
 | Keys (strict mode) | `auth gen-key --out <file>` · `auth check` · `auth sign --in <event.json>` |
 | Backup / restore | `backup --dest <new dir>` · `--data-dir <new root> restore --backup <dir>` |
-| Soak | `--data-dir <new root> soak --duration-seconds N` or `--cycles N --accelerated` |
+| Soak | `--data-dir <new root> soak --duration-seconds N` or `--cycles N --accelerated` · `--funding-profile config|funded-test-100k|low-capital-test-50` (TEST-ONLY synthetic wallets) |
 | Scenarios / simulator harness | `scenario list|run all` · `sim init|show|set-market|fault` |
 | Tests / lint | `.\.venv-exec\Scripts\python.exe -m pytest --basetemp $env:TEMP\aseke-pt` · `.\.venv-exec\Scripts\python.exe -m pyflakes src tests scripts` |
 
@@ -111,6 +114,8 @@ or SQLite sidecar files as routine recovery; initialise a new root instead.
 ## Limitations (summary)
 Synthetic venues only; no liquidation/funding model; separate (non-bracket) protective orders;
 source-risk metadata informational only; amendments ABSOLUTE only; HMAC is shared-key
-authentication only; extended (24 h) soak not yet run. Full lists:
+authentication only; the original 24 h soak proves duration and stability, not sustained entry
+coverage (its 1,000 USDT synthetic wallets were exhausted). Full lists:
 [Phase 2A](docs/phase2a-acceptance-report.md#limitations),
-[Phase 2B](docs/phase2b-acceptance-report.md#remaining-limitations).
+[Phase 2B](docs/phase2b-acceptance-report.md#remaining-limitations),
+[Phase 2C](docs/phase2c-acceptance-report.md#remaining-limitations).

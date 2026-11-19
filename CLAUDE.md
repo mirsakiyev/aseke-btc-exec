@@ -23,7 +23,8 @@ Key paths: `src/aseke_exec/engine.py` (lifecycle), `planning.py` (pure math),
 
 `runtime_policy.py` (approved-runtime gate; pin in `config/runtime-lock.json`),
 `scripts/setup.ps1` (provisioning), `scripts/storage_compat.py` (cross-runtime storage evidence),
-`docs/phase2b-acceptance-report.md` (current verdict).
+`soakgen.py` (seeded soak workload, validated before publish),
+`docs/phase2c-acceptance-report.md` (current verdict; Phase 2B report covers the runtime).
 
 Commands: `.venv-exec\Scripts\python -m pytest --basetemp $env:TEMP\aseke-pt` ·
 `.\scripts\aseke-exec.ps1 scenario run all` · `.\scripts\aseke-exec.ps1 runtime-info`.

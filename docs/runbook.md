@@ -124,10 +124,56 @@ Restoring the simulator models restoring the venue too; with a real venue only t
 would be restored and startup reconciliation would reveal any divergence.
 
 ## Soak
-* Short real-time smoke, strict signed (Phase 2B: 180.4 s, 333 cycles):
-  `.\scripts\aseke-exec.ps1 --config config\sim-strict.toml --data-dir runtime\soak-smoke-<ts> soak --duration-seconds 180 --poll-seconds 0.5 --progress-every-seconds 30`
+* Short real-time smoke, strict signed, funded TEST-ONLY wallets (Phase 2C):
+  `.\scripts\aseke-exec.ps1 --config config\sim-strict.toml --data-dir runtime\soak-smoke-<ts> soak --duration-seconds 150 --poll-seconds 0.5 --progress-every-seconds 30 --funding-profile funded-test-100k`
 * Accelerated deterministic stress (injected clock — **not** a real-time soak):
-  `.\scripts\aseke-exec.ps1 --data-dir runtime\stress-1 soak --cycles 3000 --accelerated --poll-seconds 1`
+  `.\scripts\aseke-exec.ps1 --data-dir runtime\stress-1 soak --cycles 3000 --accelerated --poll-seconds 2 --funding-profile funded-test-100k`
+
+**Workload (Phase 2C).** Signals come from `src/aseke_exec/soakgen.py`. The seeded random walk is
+the same as in Phase 2A/2B, with identical RNG draws, so a seed replays exactly; only the exit
+levels are corrected. The 500/800/1500 offsets stay unchanged unless a level below the reference
+would sit under 50 % of it. In that case all three offsets of that signal are scaled by one factor
+and floored to the instruments' common tick.
+
+Every generated OPEN passes the production contract parser and a tick check BEFORE it is signed
+and published. A generator failure is counted in `workload_generator.generator_errors`, is never
+published, and makes the soak exit 1. The clean workload permits **no** invalid generated signal;
+deliberately invalid signals are tested separately (tests/test_soak_workload.py).
+
+**Funding profiles** (`--funding-profile`) set TEST-ONLY synthetic wallets for the NEW simulator.
+The default `config` keeps the config's 1,000 USDT. Only starting wallets change. These all come
+from the config unchanged: margin per trade (100 USDT), signal leverage (5x), isolated margin,
+tolerances, fees, instrument rules and hard limits. Nothing ever replenishes a wallet.
+
+| Profile | Wallet per account | Expected rejections |
+|---|---|---|
+| `config` | as configured (1,000 USDT) | `OVERLAPPING_TRADE` |
+| `funded-test-100k` | 100,000 synthetic USDT | `OVERLAPPING_TRADE` (collateral refusals are *unexpected*) |
+| `low-capital-test-50` | 50 synthetic USDT (negative test) | `INSUFFICIENT_COLLATERAL` |
+
+**Exit codes:**
+* **0:** the run completed with no invariant violation, storage ok, and `workload_acceptance.ok`.
+  That means no generator error, every published signal journaled, no unexpected rejection, and
+  all reconciliation checks true.
+* **1:** any of those failed. The console prints `SOAK WORKLOAD REVIEW REQUIRED` with the reason.
+* **5:** interrupted (partial evidence).
+
+A `config`-profile run that exhausts its 1,000 USDT therefore exits 1. Collateral exhaustion is
+reported for review and never relabelled as expected.
+
+**Report additions** (`aseke.exec.soak-report/3`):
+* `funding`: profile, starting and configured balances, config hash, effective fingerprint.
+* `workload_generator` and `workload_acceptance`.
+* `reconciliation`: generated, published, ingested, archived, quarantined and remaining-inbox
+  signals; OPEN events × routed accounts = executions; journal vs simulator orders and fills.
+* `balances`: starting balance, ending wallet and available, realized P&L, fees, and whether the
+  ledger reconciles.
+* `coverage_by_quarter`: per-account closed executions and rejections by reason, per run quarter.
+* `invariant_check_ms`.
+* Checkpoints also carry `wallets`.
+
+The report measures harness behaviour. It does not validate strategy profitability, liquidation,
+funding or exchange fills.
 
 ### Extended operator soak (24 h) — operator-started, not run by any agent
 Run it deliberately in its **own** PowerShell console at the repository root. Nothing is
@@ -149,10 +195,17 @@ $env:ASEKE_EXEC_HMAC_SIM_DEMO_K1 = (Get-Content -Raw secrets\soak-k1.key).Trim()
 ```
 Keep the PC awake for the run. Changing power settings is your decision; no script changes them.
 
-**Start** (foreground; Ctrl+C stops it cleanly):
+**Windows console note.** Clicking inside a classic console window enters *Select* mode (the
+title bar shows "Select"). That pauses the console's output, and the process blocks when it next
+writes, so a finished soak can look hung or print its final lines late. Press `Esc` (or
+right-click) to leave Select mode. In the original 24 h run this delayed `Soak exit code: 0`; it
+is not an engine defect. To avoid it, do not click inside the soak console while it runs.
+
+**Start** (foreground; Ctrl+C stops it cleanly). Phase 2C recommends the funded profile for a
+repeat run (see docs/phase2c-acceptance-report.md); `config` reproduces the original 1,000 USDT run:
 ```powershell
-.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt soak --duration-seconds 86400 --poll-seconds 2 --progress-every-seconds 300
-"soak exit code: $LASTEXITCODE"   # 0 completed+clean, 1 violations/storage problem, 5 interrupted (partial)
+.\scripts\aseke-exec.ps1 --config $cfg --data-dir $rt soak --duration-seconds 86400 --poll-seconds 2 --progress-every-seconds 300 --funding-profile funded-test-100k
+"soak exit code: $LASTEXITCODE"   # 0 completed+clean, 1 violations/storage/workload review, 5 interrupted (partial)
 ```
 
 **Progress, from a second console.** These commands open read-only (`mode=ro`) connections
@@ -194,16 +247,20 @@ real-exchange guarantees:
 | Exposure | zero duplicate or reversed exposure; zero `invariant_violations_total` |
 | Persistence | `integrity_check = ok` and 0 foreign-key violations for both stores; no lost executed exit quantities (exit qty = entry qty for every CLOSED execution) |
 | Incidents | no unresolved unexpected CRITICAL alerts or incidents (`critical_alerts`, `open_incidents`) |
-| Rejections | every rejection classified; only the documented expected `OVERLAPPING_TRADE`, or explained |
+| Rejections | every rejection classified; only the profile's documented expected reasons (`workload_acceptance.unexpected_rejections` empty), or explained |
+| Workload | `workload_generator.generator_errors = 0`; `ingest_outcomes` only `JOURNALED`; `reconciliation.all_reconcile = true` |
+| Coverage | funded profile: every `coverage_by_quarter` entry shows closed executions for both accounts and no `INSUFFICIENT_COLLATERAL`; ending `available` far above one trade's reservation |
 | Protection | review `protection.max_unprotected_seconds` and its distribution; the entry→verified-stop interval is **measured, not eliminated** |
 | Resources | review latency p50/p95/p99/max, first-10 vs last-10 means, working set first/last/max, journal growth. No universal limit is set; judge the trends |
 
 Deliberate fault or restart exercises run in **separate** roots (for example the crash-point
 recovery demo in docs/phase2b-acceptance-report.md) and must never be reported as the clean soak.
-The soak validates neither funding nor liquidation behaviour.
+The soak validates neither funding nor liquidation behaviour. A backup is evidence of a runtime
+root, never a substitute for committed source code.
 
 Invariants checked every cycle: no exposure without an active execution, no reversal, one
   active execution per account/instrument, a venue stop covering every protected position,
   `stop_coverage=VERIFIED` only when the venue holds a covering stop, at most one live stop,
   working TP quantity ≤ position, CLOSING never silently uncovered, exit qty = entry qty
-  for every closed execution, no orphan working orders.
+  for every closed execution (checked once when it closes, and all re-checked at the end of
+  the run), no orphan working orders.

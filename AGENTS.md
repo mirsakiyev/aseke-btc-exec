@@ -76,8 +76,14 @@ this repository. CLAUDE.md points here. Keep both in sync.
   proof of absence (bounded not-found checks).
 - **Crash points:** `ASEKE_EXEC_CRASHPOINT` (src/aseke_exec/faults.py) is a test hook; tests may
   kill only subprocesses they started. Never terminate user workers or touch aseke-btc-lab.
+- **Soak workload (Phase 2C):** the clean soak publishes only signals that pass the production
+  parser (`soakgen.py`); never loosen the contract to make a workload pass, never relabel
+  `INSUFFICIENT_COLLATERAL` as expected outside `low-capital-test-50`, and never present a
+  funded TEST-ONLY profile as real capital or as the original 24 h run. Historical soak roots and
+  their backups are immutable evidence: read only, never start a worker against them.
 - Raw test counts are not a readiness gate; the readiness verdict lives in
-  docs/phase2b-acceptance-report.md (Phase 2A evidence: docs/phase2a-acceptance-report.md).
+  docs/phase2c-acceptance-report.md (earlier: docs/phase2b-acceptance-report.md,
+  docs/phase2a-acceptance-report.md).
 
 ## Engineering conventions
 - Code stays compatible with Python 3.12+ (`requires-python`); the approved execution runtime is
